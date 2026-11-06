@@ -17,7 +17,13 @@ export async function api(path, { method = 'GET', body } = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && path !== '/login') onUnauthorized();
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    if (data.error) throw new Error(data.error);
+    // No JSON body: the API itself didn't answer (crashed, not running, or not deployed).
+    if (res.status >= 500)
+      throw new Error(`The server isn't responding (error ${res.status}). Check that the API is running and its settings are filled in.`);
+    throw new Error(`Request failed (${res.status})`);
+  }
   return data;
 }
 

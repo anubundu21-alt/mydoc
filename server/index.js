@@ -13,31 +13,39 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // and several short-lived instances can serve requests side by side.
 const IS_VERCEL = !!process.env.VERCEL;
 
-const {
-  APP_USERNAME,
-  APP_PASSWORD,
-  SUPABASE_URL,
-  SUPABASE_PUBLISHABLE_KEY,
-  SUPABASE_SECRET_KEY,
-  SUPABASE_BUCKET = 'mydoc',
-  SESSION_TTL = '12h',
-  PORT = 4000,
-} = process.env;
+// Values pasted into hosting dashboards often carry stray spaces or newlines.
+const env = (name, fallback = '') => (process.env[name] ?? '').trim() || fallback;
 
-for (const [name, value] of Object.entries({ APP_USERNAME, APP_PASSWORD, SUPABASE_URL, SUPABASE_SECRET_KEY })) {
-  if (!value) {
-    throw new Error(`Missing required environment variable ${name}. See server/.env.example.`);
-  }
-}
+const APP_USERNAME = env('APP_USERNAME');
+const APP_PASSWORD = env('APP_PASSWORD');
+const SUPABASE_URL = env('SUPABASE_URL').replace(/\/+$/, '');
+const SUPABASE_PUBLISHABLE_KEY = env('SUPABASE_PUBLISHABLE_KEY');
+const SUPABASE_SECRET_KEY = env('SUPABASE_SECRET_KEY');
+const SUPABASE_BUCKET = env('SUPABASE_BUCKET', 'mydoc');
+const SESSION_TTL = env('SESSION_TTL', '12h');
+const PORT = env('PORT', '4000');
+let JWT_SECRET = env('JWT_SECRET');
 
-let JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET && IS_VERCEL) {
-  // Each serverless instance would invent its own secret and reject the others' logins.
-  throw new Error('JWT_SECRET must be set in the Vercel project environment variables.');
+// Problems are collected instead of thrown, so the server still starts and every API call
+// answers with a message naming what to fix (a crash shows up only as a bare "500").
+const configErrors = [];
+const missing = Object.entries({ APP_USERNAME, APP_PASSWORD, SUPABASE_URL, SUPABASE_SECRET_KEY })
+  .filter(([, value]) => !value)
+  .map(([name]) => name);
+// Each serverless instance would invent its own secret and reject the others' logins.
+if (!JWT_SECRET && IS_VERCEL) missing.push('JWT_SECRET');
+if (missing.length) configErrors.push(`missing ${missing.join(', ')}`);
+if (SUPABASE_URL && !/^https?:\/\/[^\s/]+$/.test(SUPABASE_URL)) {
+  configErrors.push('SUPABASE_URL must look like https://<project-id>.supabase.co');
 }
+const CONFIG_HELP = IS_VERCEL
+  ? 'Fix this in Vercel → Project → Settings → Environment Variables, then redeploy.'
+  : 'Fix this in server/.env (see server/.env.example) and restart the server.';
+if (configErrors.length) console.error(`Server setup incomplete: ${configErrors.join('; ')}. ${CONFIG_HELP}`);
+
 if (!JWT_SECRET) {
   JWT_SECRET = crypto.randomBytes(48).toString('hex');
-  console.warn('JWT_SECRET not set: using a random one. Everyone is logged out when the server restarts.');
+  if (!IS_VERCEL) console.warn('JWT_SECRET not set: using a random one. Everyone is logged out when the server restarts.');
 }
 
 // Sections map to top-level folders in the bucket.
@@ -48,9 +56,16 @@ export const SECTIONS = {
   ananya: { label: 'Ananya', group: 'Personal Documents' },
 };
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+let supabase = null;
+if (!configErrors.length) {
+  try {
+    supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  } catch (err) {
+    configErrors.push(`could not set up Supabase (${err.message})`);
+  }
+}
 const bucket = () => supabase.storage.from(SUPABASE_BUCKET);
 
 async function ensureBucket() {
@@ -123,6 +138,16 @@ if (IS_VERCEL) {
   });
 }
 app.use(express.json({ limit: '100kb' }));
+
+// No login needed: says whether the server is set up (names of problems only, never values).
+app.get('/api/health', (req, res) => {
+  res.status(configErrors.length ? 500 : 200).json({ ok: !configErrors.length, problems: configErrors });
+});
+
+app.use('/api', (req, res, next) => {
+  if (!configErrors.length) return next();
+  res.status(500).json({ error: `Server setup incomplete: ${configErrors.join('; ')}. ${CONFIG_HELP}` });
+});
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
@@ -285,6 +310,6 @@ if (!IS_VERCEL) {
   app.listen(PORT, () => console.log(`MyDoc server listening on http://localhost:${PORT}`));
 }
 
-ensureBucket().catch((err) => console.error('Could not verify/create the storage bucket:', err.message));
+if (supabase) ensureBucket().catch((err) => console.error('Could not verify/create the storage bucket:', err.message));
 
 export default app;

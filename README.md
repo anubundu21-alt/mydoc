@@ -86,6 +86,12 @@ Notes:
 - On Vercel the server runs as a serverless function: it doesn't call `app.listen()` and doesn't serve the React files.
 - The login rate limit is kept in memory for each running copy of the function, so on Vercel it is approximate.
 
+## Troubleshooting
+
+- **"Server setup incomplete: missing …" when signing in**: the server is missing settings. Add the listed ones to the Vercel project's Environment Variables and redeploy, or locally to `server/.env` and restart.
+- **Check the setup**: open `/api/health` on your site. It needs no login and lists any settings problems by name (never the values).
+- **"The server isn't responding"**: the API isn't running. Locally, start it with `npm run dev` from the repo root, not just the client. On Vercel, check the `server` service's logs.
+
 ## File size limit
 
 Uploads go straight from your browser to Supabase, so this server sets no size limit.
