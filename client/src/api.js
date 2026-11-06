@@ -27,17 +27,13 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
-// Upload the original file bytes straight to Supabase Storage with progress.
-export async function uploadFile(section, file, onProgress) {
-  const { signedUrl, apiKey, path } = await api('/files/upload-url', {
-    method: 'POST',
-    body: { section, name: file.name },
-  });
-  await new Promise((resolve, reject) => {
+// PUT a file to a Supabase signed upload URL, with progress.
+function putToSignedUrl(signedUrl, apiKey, blob, name, { upsert = false, onProgress } = {}) {
+  return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', signedUrl);
     if (apiKey) xhr.setRequestHeader('apikey', apiKey);
-    xhr.setRequestHeader('x-upsert', 'false');
+    xhr.setRequestHeader('x-upsert', String(upsert));
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) return resolve();
@@ -51,10 +47,30 @@ export async function uploadFile(section, file, onProgress) {
     xhr.onerror = () => reject(new Error('Network error during upload'));
     const form = new FormData();
     form.append('cacheControl', '3600');
-    form.append('', file, file.name); // sent as-is: original quality
+    form.append('', blob, name); // sent as-is: original quality
     xhr.send(form);
   });
+}
+
+// Upload the original file bytes straight to Supabase Storage with progress.
+export async function uploadFile(section, file, onProgress) {
+  const { signedUrl, apiKey, path } = await api('/files/upload-url', {
+    method: 'POST',
+    body: { section, name: file.name },
+  });
+  await putToSignedUrl(signedUrl, apiKey, file, file.name, { onProgress });
   return path;
+}
+
+// Store (or replace) the small cover image shown on a file's card.
+export async function uploadThumb(path, blob) {
+  const { signedUrl, apiKey } = await api('/files/thumb-upload-url', { method: 'POST', body: { path } });
+  await putToSignedUrl(signedUrl, apiKey, blob, 'cover.jpg', { upsert: true });
+}
+
+// Short-lived link to read a stored file (used to make covers for older uploads).
+export async function fileUrl(path) {
+  return (await api(`/files/download-url?preview=1&path=${encodeURIComponent(path)}`)).url;
 }
 
 export async function downloadFile(path) {

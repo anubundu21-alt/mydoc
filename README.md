@@ -11,6 +11,7 @@ It uses React for the frontend, Node.js/Express for the backend and Supabase Sto
   - **Personal Documents**: **Rakesh**, **Priyanka** and **Ananya**
 - Upload with the button or by drag & drop. You can upload several files at once and see a progress bar for each.
 - Files are stored **byte-for-byte as uploaded**: no compression or conversion, so they keep their original quality.
+- **Covers on the cards:** the first page of a PDF, the cover image of an EPUB, or the photo itself. They're made in the browser as small JPEGs and stored in `_thumbs/` in the bucket. Files uploaded before covers existed get theirs the first time their folder is opened. Other types (MOBI, Word…) show a coloured file-type badge.
 - Download keeps the original file name. You can also open a file in a new tab to preview it.
 - Rename, delete, multi-select download/delete, search, and sort by name, size or date.
 - Works on phones (the sidebar becomes a menu).

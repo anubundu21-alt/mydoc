@@ -121,6 +121,14 @@ function assertPath(p) {
   return { section, file };
 }
 
+// Cover thumbnails (small JPEGs made in the browser) live outside the section folders,
+// keyed by the file's id so they survive renames: _thumbs/<section>/<id>.jpg
+const THUMBS = '_thumbs';
+function thumbKey(section, file) {
+  const id = file.includes('__') ? file.slice(0, file.indexOf('__')) : file;
+  return `${THUMBS}/${section}/${id}.jpg`;
+}
+
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ---------- app ----------
@@ -176,30 +184,32 @@ app.get('/api/me', (req, res) => res.json({ username: req.user.sub }));
 
 app.get('/api/sections', (req, res) => res.json(SECTIONS));
 
-async function listSection(section) {
-  const files = [];
+// All objects directly inside a folder (skips sub-folders and placeholders).
+async function listFolder(folder) {
+  const items = [];
   const pageSize = 1000;
   for (let offset = 0; ; offset += pageSize) {
-    const { data, error } = await bucket().list(section, {
+    const { data, error } = await bucket().list(folder, {
       limit: pageSize,
       offset,
       sortBy: { column: 'created_at', order: 'desc' },
     });
     if (error) throw error;
-    for (const item of data) {
-      if (!item.id || item.name === '.emptyFolderPlaceholder') continue; // skip folders/placeholders
-      files.push({
-        path: `${section}/${item.name}`,
-        name: displayName(item.name),
-        size: item.metadata?.size ?? 0,
-        type: item.metadata?.mimetype ?? '',
-        createdAt: item.created_at,
-        updatedAt: item.updated_at,
-      });
-    }
+    items.push(...data.filter((item) => item.id && item.name !== '.emptyFolderPlaceholder'));
     if (data.length < pageSize) break;
   }
-  return files;
+  return items;
+}
+
+async function listSection(section) {
+  return (await listFolder(section)).map((item) => ({
+    path: `${section}/${item.name}`,
+    name: displayName(item.name),
+    size: item.metadata?.size ?? 0,
+    type: item.metadata?.mimetype ?? '',
+    createdAt: item.created_at,
+    updatedAt: item.updated_at,
+  }));
 }
 
 // List files in a section
@@ -208,7 +218,18 @@ app.get(
   asyncRoute(async (req, res) => {
     const section = String(req.query.section || '');
     assertSection(section);
-    res.json(await listSection(section));
+    const [files, thumbs] = await Promise.all([listSection(section), listFolder(`${THUMBS}/${section}`)]);
+    // Attach a short-lived link to each file's cover thumbnail, when one exists.
+    const existing = new Set(thumbs.map((t) => `${THUMBS}/${section}/${t.name}`));
+    const withThumb = files.filter((f) => existing.has(thumbKey(section, f.path.split('/')[1])));
+    if (withThumb.length) {
+      const keys = withThumb.map((f) => thumbKey(section, f.path.split('/')[1]));
+      const { data, error } = await bucket().createSignedUrls(keys, 60 * 60);
+      if (error) throw error;
+      const urlByKey = new Map(data.filter((d) => d.signedUrl).map((d) => [d.path, d.signedUrl]));
+      for (const f of withThumb) f.thumbUrl = urlByKey.get(thumbKey(section, f.path.split('/')[1])) || null;
+    }
+    res.json(files);
   })
 );
 
@@ -247,6 +268,17 @@ app.post(
   })
 );
 
+// Signed URL for the browser to upload (or replace) a file's cover thumbnail
+app.post(
+  '/api/files/thumb-upload-url',
+  asyncRoute(async (req, res) => {
+    const { section, file } = assertPath(req.body?.path);
+    const { data, error } = await bucket().createSignedUploadUrl(thumbKey(section, file), { upsert: true });
+    if (error) throw error;
+    res.json({ signedUrl: data.signedUrl, apiKey: SUPABASE_PUBLISHABLE_KEY || null });
+  })
+);
+
 // Signed URL to download (or preview) the original file
 app.get(
   '/api/files/download-url',
@@ -272,6 +304,9 @@ app.patch(
     if (to !== from) {
       const { error } = await bucket().move(from, to);
       if (error) throw error;
+      // Files without an id get one now, so their thumbnail key changes too (best effort).
+      const [oldThumb, newThumb] = [thumbKey(section, file), thumbKey(section, to.split('/')[1])];
+      if (oldThumb !== newThumb) await bucket().move(oldThumb, newThumb).catch(() => {});
     }
     res.json({ path: to, name: displayName(to.split('/')[1]) });
   })
@@ -282,8 +317,11 @@ app.delete(
   '/api/files',
   asyncRoute(async (req, res) => {
     const paths = Array.isArray(req.body?.paths) ? req.body.paths : [req.body?.path];
-    paths.forEach(assertPath);
-    const { error } = await bucket().remove(paths);
+    const thumbs = paths.map((p) => {
+      const { section, file } = assertPath(p);
+      return thumbKey(section, file);
+    });
+    const { error } = await bucket().remove([...paths, ...thumbs]); // missing thumbnails are ignored
     if (error) throw error;
     res.json({ deleted: paths.length });
   })

@@ -1,7 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, uploadFile, downloadFile, previewFile } from './api.js';
+import { api, uploadFile, uploadThumb, fileUrl, downloadFile, previewFile } from './api.js';
 import Icon from './Icon.jsx';
-import { ConfirmModal, FileBadge, RenameModal, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
+import { ConfirmModal, FileBadge, RenameModal, fileKind, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
+import { canMakeThumb, makeThumb, thumbKind } from './thumbs.js';
+
+// Files we already tried to make a cover for in this browser session (so failures aren't retried).
+const thumbTried = new Set();
+
+// The book cover / photo when there is one, otherwise the coloured file-type badge.
+function Cover({ file, url, size }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [url]);
+  if (!url || failed) return <FileBadge name={file.name} large={size === 'lg'} />;
+  const photo = thumbKind(file.name, file.type) === 'image';
+  return (
+    <img
+      className={`cover cover-${size} ${photo ? 'cover-photo' : ''}`}
+      src={url}
+      alt=""
+      loading="lazy"
+      draggable="false"
+      onError={() => setFailed(true)}
+    />
+  );
+}
 
 const SORTS = {
   'date-desc': 'Newest first',
@@ -34,6 +56,8 @@ export default function FileManager({ section, stats, onChanged }) {
   const [busyPath, setBusyPath] = useState(null);
   const [confirm, setConfirm] = useState(null); // { title, message, onConfirm }
   const [renaming, setRenaming] = useState(null);
+  const [localThumbs, setLocalThumbs] = useState({}); // path → object URL of a cover made in this tab
+  const thumbOf = (f) => localThumbs[f.path] || f.thumbUrl;
   const inputRef = useRef(null);
   const dragDepth = useRef(0);
 
@@ -60,6 +84,29 @@ export default function FileManager({ section, stats, onChanged }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Make covers for files uploaded before covers existed (one at a time, in the background).
+  useEffect(() => {
+    let cancelled = false;
+    const todo = files.filter((f) => !f.thumbUrl && !thumbTried.has(f.path) && canMakeThumb(f));
+    (async () => {
+      for (const f of todo) {
+        if (cancelled) return;
+        thumbTried.add(f.path);
+        try {
+          const blob = await makeThumb(await fileUrl(f.path), f.name, f.type);
+          if (!blob) continue;
+          await uploadThumb(f.path, blob);
+          setLocalThumbs((t) => ({ ...t, [f.path]: URL.createObjectURL(blob) }));
+        } catch (e) {
+          console.warn('Cover not saved for', f.name, e);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [files]);
 
   const refresh = async () => {
     await load();
@@ -97,9 +144,16 @@ export default function FileManager({ section, stats, onChanged }) {
       while (queue.length) {
         const it = queue.shift();
         try {
-          await uploadFile(section.id, it.file, (p) => update(it.id, { progress: p }));
+          const path = await uploadFile(section.id, it.file, (p) => update(it.id, { progress: p }));
           update(it.id, { progress: 1, status: 'done' });
           ok++;
+          // Cover from the local copy: no need to download the file again.
+          const blob = await makeThumb(it.file, it.file.name, it.file.type);
+          if (blob) {
+            thumbTried.add(path);
+            await uploadThumb(path, blob).catch((e) => console.warn('Cover not saved for', it.file.name, e));
+            setLocalThumbs((t) => ({ ...t, [path]: URL.createObjectURL(blob) }));
+          }
         } catch (e) {
           update(it.id, { status: 'error', error: e.message });
         }
@@ -417,7 +471,8 @@ export default function FileManager({ section, stats, onChanged }) {
                 <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
               </label>
               <button className="card-preview" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
-                <FileBadge name={f.name} large />
+                <Cover file={f} url={thumbOf(f)} size="lg" />
+                {thumbOf(f) && <span className={`type-pill pill-${fileKind(f.name).kind}`}>{fileKind(f.name).ext}</span>}
               </button>
               <div className="card-body">
                 <div className="card-name" title={f.name}>
@@ -451,7 +506,7 @@ export default function FileManager({ section, stats, onChanged }) {
                 <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
               </label>
               <button className="row-name" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
-                <FileBadge name={f.name} />
+                <Cover file={f} url={thumbOf(f)} size="sm" />
                 <span className="truncate">{f.name}</span>
                 <span className="row-meta-sm muted">
                   {formatSize(f.size)} · {formatDate(f.createdAt)}
