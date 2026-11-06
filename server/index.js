@@ -6,7 +6,11 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
-import { createClient } from '@supabase/supabase-js';
+import { SECTIONS, CHUNK_SIZE, httpError } from './storage/util.js';
+import { createSupabaseStorage } from './storage/supabase.js';
+import { createDriveStorage } from './storage/gdrive.js';
+
+export { SECTIONS };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // On Vercel this file runs as a serverless function: no app.listen(), no static files,
@@ -18,10 +22,6 @@ const env = (name, fallback = '') => (process.env[name] ?? '').trim() || fallbac
 
 const APP_USERNAME = env('APP_USERNAME');
 const APP_PASSWORD = env('APP_PASSWORD');
-const SUPABASE_URL = env('SUPABASE_URL').replace(/\/+$/, '');
-const SUPABASE_PUBLISHABLE_KEY = env('SUPABASE_PUBLISHABLE_KEY');
-const SUPABASE_SECRET_KEY = env('SUPABASE_SECRET_KEY');
-const SUPABASE_BUCKET = env('SUPABASE_BUCKET', 'mydoc');
 const SESSION_TTL = env('SESSION_TTL', '12h');
 const PORT = env('PORT', '4000');
 let JWT_SECRET = env('JWT_SECRET');
@@ -29,53 +29,51 @@ let JWT_SECRET = env('JWT_SECRET');
 // Problems are collected instead of thrown, so the server still starts and every API call
 // answers with a message naming what to fix (a crash shows up only as a bare "500").
 const configErrors = [];
-const missing = Object.entries({ APP_USERNAME, APP_PASSWORD, SUPABASE_URL, SUPABASE_SECRET_KEY })
+const missing = Object.entries({ APP_USERNAME, APP_PASSWORD })
   .filter(([, value]) => !value)
   .map(([name]) => name);
 // Each serverless instance would invent its own secret and reject the others' logins.
 if (!JWT_SECRET && IS_VERCEL) missing.push('JWT_SECRET');
 if (missing.length) configErrors.push(`missing ${missing.join(', ')}`);
-if (SUPABASE_URL && !/^https?:\/\/[^\s/]+$/.test(SUPABASE_URL)) {
-  configErrors.push('SUPABASE_URL must look like https://<project-id>.supabase.co');
-}
-const CONFIG_HELP = IS_VERCEL
-  ? 'Fix this in Vercel → Project → Settings → Environment Variables, then redeploy.'
-  : 'Fix this in server/.env (see server/.env.example) and restart the server.';
-if (configErrors.length) console.error(`Server setup incomplete: ${configErrors.join('; ')}. ${CONFIG_HELP}`);
-
 if (!JWT_SECRET) {
   JWT_SECRET = crypto.randomBytes(48).toString('hex');
   if (!IS_VERCEL) console.warn('JWT_SECRET not set: using a random one. Everyone is logged out when the server restarts.');
 }
 
-// Sections map to top-level folders in the bucket.
-export const SECTIONS = {
-  ebooks: { label: 'Ebooks', group: 'Ebooks' },
-  rakesh: { label: 'Rakesh', group: 'Personal Documents' },
-  priyanka: { label: 'Priyanka', group: 'Personal Documents' },
-  ananya: { label: 'Ananya', group: 'Personal Documents' },
-};
+// ---------- storage: Google Drive when its keys are set, otherwise Supabase ----------
 
-let supabase = null;
-if (!configErrors.length) {
-  try {
-    supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
-      auth: { persistSession: false, autoRefreshToken: false },
+// Cover images are shown with <img>, which can't send the login token, so their links carry
+// a signature instead. Links change once an hour, which lets the browser cache covers meanwhile.
+const thumbSig = (id, exp) => crypto.createHmac('sha256', JWT_SECRET).update(`cover|${id}|${exp}`).digest('base64url');
+function signThumbUrl(id) {
+  const exp = (Math.floor(Date.now() / 3_600_000) + 2) * 3600; // 1–2 hours from now, in seconds
+  return `/api/thumb/${encodeURIComponent(id)}?exp=${exp}&sig=${thumbSig(id, exp)}`;
+}
+
+const USE_DRIVE = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'].some((n) => env(n));
+const storage = USE_DRIVE
+  ? createDriveStorage({
+      clientId: env('GOOGLE_CLIENT_ID'),
+      clientSecret: env('GOOGLE_CLIENT_SECRET'),
+      refreshToken: env('GOOGLE_REFRESH_TOKEN'),
+      rootFolderName: env('GOOGLE_DRIVE_FOLDER_NAME', 'MyDoc Vault'),
+      rootFolderId: env('GOOGLE_DRIVE_FOLDER_ID'),
+      apiBase: env('GOOGLE_API_BASE', 'https://www.googleapis.com'), // overridable for tests
+      tokenUrl: env('GOOGLE_TOKEN_URL', 'https://oauth2.googleapis.com/token'),
+      signThumbUrl,
+    })
+  : createSupabaseStorage({
+      url: env('SUPABASE_URL').replace(/\/+$/, ''),
+      secretKey: env('SUPABASE_SECRET_KEY'),
+      publishableKey: env('SUPABASE_PUBLISHABLE_KEY'),
+      bucketName: env('SUPABASE_BUCKET', 'mydoc'),
     });
-  } catch (err) {
-    configErrors.push(`could not set up Supabase (${err.message})`);
-  }
-}
-const bucket = () => supabase.storage.from(SUPABASE_BUCKET);
+configErrors.push(...storage.configErrors);
 
-async function ensureBucket() {
-  const { data, error } = await supabase.storage.getBucket(SUPABASE_BUCKET);
-  if (data) return;
-  if (error && !/not found/i.test(error.message)) throw error;
-  const { error: createError } = await supabase.storage.createBucket(SUPABASE_BUCKET, { public: false });
-  if (createError && !/already exists/i.test(createError.message)) throw createError;
-  console.log(`Created private storage bucket "${SUPABASE_BUCKET}".`);
-}
+const CONFIG_HELP = IS_VERCEL
+  ? 'Fix this in Vercel → Project → Settings → Environment Variables, then redeploy.'
+  : 'Fix this in server/.env (see server/.env.example) and restart the server.';
+if (configErrors.length) console.error(`Server setup incomplete: ${configErrors.join('; ')}. ${CONFIG_HELP}`);
 
 // ---------- helpers ----------
 
@@ -85,48 +83,18 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-// Supabase object keys allow a limited character set; keep the name readable.
-function sanitizeName(name) {
-  const base = path.basename(String(name || '')).normalize('NFKD');
-  const cleaned = base
-    .replace(/[^\w.\- ()[\],+&@=]/g, '_')
-    .replace(/\s+/g, ' ')
-    .replace(/_+/g, '_')
-    .trim();
-  return cleaned.slice(-180) || 'file';
-}
-
-// Stored as "<section>/<id>__<name>" so identical names never clash.
-function displayName(objectName) {
-  const i = objectName.indexOf('__');
-  return i > 0 ? objectName.slice(i + 2) : objectName;
-}
-
 function assertSection(section) {
-  if (!Object.hasOwn(SECTIONS, section)) {
-    const err = new Error('Unknown section');
-    err.status = 400;
-    throw err;
-  }
+  if (!Object.hasOwn(SECTIONS, section)) throw httpError(400, 'Unknown section');
 }
 
-function assertPath(p) {
+// "<section>/<file>" where <file> is a storage key (Supabase) or a file id (Google Drive).
+function parsePath(p) {
   const [section, ...rest] = String(p || '').split('/');
   const file = rest.join('/');
   if (!Object.hasOwn(SECTIONS, section) || !file || file.includes('/') || file.includes('..')) {
-    const err = new Error('Invalid file path');
-    err.status = 400;
-    throw err;
+    throw httpError(400, 'Invalid file path');
   }
-  return { section, file };
-}
-
-// Cover thumbnails (small JPEGs made in the browser) live outside the section folders,
-// keyed by the file's id so they survive renames: _thumbs/<section>/<id>.jpg
-const THUMBS = '_thumbs';
-function thumbKey(section, file) {
-  const id = file.includes('__') ? file.slice(0, file.indexOf('__')) : file;
-  return `${THUMBS}/${section}/${id}.jpg`;
+  return { path: `${section}/${file}`, section, file };
 }
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -135,7 +103,7 @@ const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next
 
 const app = express();
 app.disable('x-powered-by');
-if (IS_VERCEL) app.set('trust proxy', 1); // real client IP for the login rate limiter
+if (IS_VERCEL) app.set('trust proxy', 1); // real client IP and https:// for the page's origin
 
 // All routes live under /api, which is also the public path Vercel rewrites to this service.
 // If the platform hands the request over without that prefix, put it back.
@@ -149,13 +117,29 @@ app.use(express.json({ limit: '100kb' }));
 
 // No login needed: says whether the server is set up (names of problems only, never values).
 app.get('/api/health', (req, res) => {
-  res.status(configErrors.length ? 500 : 200).json({ ok: !configErrors.length, problems: configErrors });
+  res.status(configErrors.length ? 500 : 200).json({ ok: !configErrors.length, storage: storage.kind, problems: configErrors });
 });
 
 app.use('/api', (req, res, next) => {
   if (!configErrors.length) return next();
   res.status(500).json({ error: `Server setup incomplete: ${configErrors.join('; ')}. ${CONFIG_HELP}` });
 });
+
+// Cover image (signed link, see signThumbUrl).
+app.get(
+  '/api/thumb/:id',
+  asyncRoute(async (req, res) => {
+    const { id } = req.params;
+    const exp = Number(req.query.exp);
+    const sig = String(req.query.sig || '');
+    const expected = thumbSig(id, exp);
+    const valid = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+    if (!valid || !(exp * 1000 > Date.now())) throw httpError(403, 'Cover link expired');
+    if (!storage.readThumb) throw httpError(404, 'Not found');
+    const { type, body } = await storage.readThumb(id);
+    res.set({ 'Content-Type': type, 'Cache-Control': 'private, max-age=3600' }).send(body);
+  })
+);
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
@@ -180,37 +164,9 @@ function requireAuth(req, res, next) {
 
 app.use('/api', requireAuth);
 
-app.get('/api/me', (req, res) => res.json({ username: req.user.sub }));
+app.get('/api/me', (req, res) => res.json({ username: req.user.sub, storage: storage.kind }));
 
 app.get('/api/sections', (req, res) => res.json(SECTIONS));
-
-// All objects directly inside a folder (skips sub-folders and placeholders).
-async function listFolder(folder) {
-  const items = [];
-  const pageSize = 1000;
-  for (let offset = 0; ; offset += pageSize) {
-    const { data, error } = await bucket().list(folder, {
-      limit: pageSize,
-      offset,
-      sortBy: { column: 'created_at', order: 'desc' },
-    });
-    if (error) throw error;
-    items.push(...data.filter((item) => item.id && item.name !== '.emptyFolderPlaceholder'));
-    if (data.length < pageSize) break;
-  }
-  return items;
-}
-
-async function listSection(section) {
-  return (await listFolder(section)).map((item) => ({
-    path: `${section}/${item.name}`,
-    name: displayName(item.name),
-    size: item.metadata?.size ?? 0,
-    type: item.metadata?.mimetype ?? '',
-    createdAt: item.created_at,
-    updatedAt: item.updated_at,
-  }));
-}
 
 // List files in a section
 app.get(
@@ -218,18 +174,7 @@ app.get(
   asyncRoute(async (req, res) => {
     const section = String(req.query.section || '');
     assertSection(section);
-    const [files, thumbs] = await Promise.all([listSection(section), listFolder(`${THUMBS}/${section}`)]);
-    // Attach a short-lived link to each file's cover thumbnail, when one exists.
-    const existing = new Set(thumbs.map((t) => `${THUMBS}/${section}/${t.name}`));
-    const withThumb = files.filter((f) => existing.has(thumbKey(section, f.path.split('/')[1])));
-    if (withThumb.length) {
-      const keys = withThumb.map((f) => thumbKey(section, f.path.split('/')[1]));
-      const { data, error } = await bucket().createSignedUrls(keys, 60 * 60);
-      if (error) throw error;
-      const urlByKey = new Map(data.filter((d) => d.signedUrl).map((d) => [d.path, d.signedUrl]));
-      for (const f of withThumb) f.thumbUrl = urlByKey.get(thumbKey(section, f.path.split('/')[1])) || null;
-    }
-    res.json(files);
+    res.json(await storage.list(section));
   })
 );
 
@@ -239,7 +184,7 @@ app.get(
   asyncRoute(async (req, res) => {
     const entries = await Promise.all(
       Object.keys(SECTIONS).map(async (s) => {
-        const files = await listSection(s);
+        const files = await storage.list(s, { thumbs: false });
         return [
           s,
           {
@@ -254,42 +199,51 @@ app.get(
   })
 );
 
-// Get a one-time signed URL the browser uploads the original file to (no re-encoding, no size cap from this server).
+// Where the browser should send the original file (straight to storage, never through this server).
 app.post(
   '/api/files/upload-url',
   asyncRoute(async (req, res) => {
-    const { section, name } = req.body || {};
+    const { section, name, size, type } = req.body || {};
     assertSection(section);
-    const id = `${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`;
-    const objectPath = `${section}/${id}__${sanitizeName(name)}`;
-    const { data, error } = await bucket().createSignedUploadUrl(objectPath);
-    if (error) throw error;
-    res.json({ path: objectPath, signedUrl: data.signedUrl, apiKey: SUPABASE_PUBLISHABLE_KEY || null });
+    const origin = req.get('origin') || `${req.protocol}://${req.get('host')}`;
+    const result = await storage.createUpload({ section, name, size: Number(size) || 0, type: String(type || ''), origin });
+    res.json({ section, ...result });
   })
 );
 
-// Signed URL for the browser to upload (or replace) a file's cover thumbnail
+// Save a file's cover image (a small JPEG made in the browser)
 app.post(
-  '/api/files/thumb-upload-url',
+  '/api/files/thumb',
+  express.raw({ type: 'image/jpeg', limit: '3mb' }),
   asyncRoute(async (req, res) => {
-    const { section, file } = assertPath(req.body?.path);
-    const { data, error } = await bucket().createSignedUploadUrl(thumbKey(section, file), { upsert: true });
-    if (error) throw error;
-    res.json({ signedUrl: data.signedUrl, apiKey: SUPABASE_PUBLISHABLE_KEY || null });
+    const ref = parsePath(req.query.path);
+    if (!Buffer.isBuffer(req.body) || !req.body.length) throw httpError(400, 'Send the cover as image/jpeg');
+    await storage.saveThumb(ref, req.body);
+    res.json({ ok: true });
   })
 );
 
-// Signed URL to download (or preview) the original file
+// How to download (or preview) a file: a short-lived direct link, or "proxy" = read it in pieces
+// from /api/files/content.
 app.get(
   '/api/files/download-url',
   asyncRoute(async (req, res) => {
-    const { file } = assertPath(req.query.path);
-    const preview = req.query.preview === '1';
-    const { data, error } = await bucket().createSignedUrl(req.query.path, 60 * 5, {
-      download: preview ? false : displayName(file),
-    });
-    if (error) throw error;
-    res.json({ url: data.signedUrl });
+    const ref = parsePath(req.query.path);
+    res.json({ ...(await storage.download(ref, { preview: req.query.preview === '1' })), chunkSize: CHUNK_SIZE });
+  })
+);
+
+// One piece of a file's bytes: ?path=…&start=0&end=4194303 (inclusive, at most 4 MB)
+app.get(
+  '/api/files/content',
+  asyncRoute(async (req, res) => {
+    const ref = parsePath(req.query.path);
+    const start = Number(req.query.start);
+    const end = Number(req.query.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) throw httpError(400, 'Invalid range');
+    if (!storage.readRange) throw httpError(404, 'Not found');
+    const { type, body } = await storage.readRange(ref, start, end);
+    res.set({ 'Content-Type': type, 'Cache-Control': 'private, no-store' }).send(body);
   })
 );
 
@@ -298,17 +252,7 @@ app.patch(
   '/api/files',
   asyncRoute(async (req, res) => {
     const { path: from, name } = req.body || {};
-    const { section, file } = assertPath(from);
-    const idPart = file.includes('__') ? file.slice(0, file.indexOf('__')) : Date.now().toString(36);
-    const to = `${section}/${idPart}__${sanitizeName(name)}`;
-    if (to !== from) {
-      const { error } = await bucket().move(from, to);
-      if (error) throw error;
-      // Files without an id get one now, so their thumbnail key changes too (best effort).
-      const [oldThumb, newThumb] = [thumbKey(section, file), thumbKey(section, to.split('/')[1])];
-      if (oldThumb !== newThumb) await bucket().move(oldThumb, newThumb).catch(() => {});
-    }
-    res.json({ path: to, name: displayName(to.split('/')[1]) });
+    res.json(await storage.rename(parsePath(from), name));
   })
 );
 
@@ -317,12 +261,7 @@ app.delete(
   '/api/files',
   asyncRoute(async (req, res) => {
     const paths = Array.isArray(req.body?.paths) ? req.body.paths : [req.body?.path];
-    const thumbs = paths.map((p) => {
-      const { section, file } = assertPath(p);
-      return thumbKey(section, file);
-    });
-    const { error } = await bucket().remove([...paths, ...thumbs]); // missing thumbnails are ignored
-    if (error) throw error;
+    await storage.remove(paths.map(parsePath));
     res.json({ deleted: paths.length });
   })
 );
@@ -345,9 +284,11 @@ app.use((err, req, res, next) => {
 });
 
 if (!IS_VERCEL) {
-  app.listen(PORT, () => console.log(`MyDoc server listening on http://localhost:${PORT}`));
+  app.listen(PORT, () => console.log(`MyDoc server listening on http://localhost:${PORT} (storage: ${storage.kind})`));
 }
 
-if (supabase) ensureBucket().catch((err) => console.error('Could not verify/create the storage bucket:', err.message));
+if (!configErrors.length) {
+  storage.init().catch((err) => console.error(`Could not prepare ${storage.kind} storage:`, err.message));
+}
 
 export default app;

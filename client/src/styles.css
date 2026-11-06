@@ -389,6 +389,7 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
 /* Grid view */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 14px; }
 .card {
+  --pv-h: 260px; --pv-pad: 16px; /* cover area height and padding */
   position: relative; display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
   box-shadow: var(--shadow-sm); overflow: hidden; transition: box-shadow .2s, border-color .2s, transform .2s;
@@ -396,11 +397,17 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
 .card:hover { box-shadow: var(--shadow); border-color: var(--border-strong); transform: translateY(-2px); }
 .card.selected { border-color: var(--primary); box-shadow: 0 0 0 3px var(--ring); }
 .card.busy { opacity: .55; pointer-events: none; }
+/* Download/preview progress (Google Drive files arrive in pieces) */
+.fetch-bar { position: absolute; left: 0; right: 0; height: 4px; background: var(--surface-hover); overflow: hidden; }
+.card .fetch-bar { top: calc(var(--pv-h) - 4px); }
+.row { position: relative; }
+.row .fetch-bar { bottom: 0; }
+.fetch-bar div { height: 100%; background: linear-gradient(90deg, var(--primary), var(--primary-2)); transition: width .2s; }
+.card.busy:has(.fetch-bar), .row.busy:has(.fetch-bar) { opacity: 1; }
 .card-check { position: absolute; top: 10px; left: 10px; z-index: 1; opacity: 0; transition: opacity .15s; }
 .card:hover .card-check, .card.selected .card-check { opacity: 1; }
 .card-preview {
   position: relative; overflow: hidden;
-  --pv-h: 260px; --pv-pad: 16px;
   display: grid; place-items: center; height: var(--pv-h); padding: var(--pv-pad); border: 0; cursor: pointer;
   background: linear-gradient(180deg, var(--surface-2), var(--surface-hover));
   border-bottom: 1px solid var(--border);
@@ -547,7 +554,7 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
   .stat-icon { width: 32px; height: 32px; }
   .stat-value { font-size: 15px; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
-  .card-preview { --pv-h: 220px; --pv-pad: 12px; }
+  .card { --pv-h: 220px; --pv-pad: 12px; }
   .card-check { opacity: 1; }
   .row { grid-template-columns: 24px minmax(0, 1fr) auto; padding: 10px; }
   .row.head .col-size, .row .col-size { display: none; }

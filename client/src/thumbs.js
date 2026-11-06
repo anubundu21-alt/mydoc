@@ -74,7 +74,15 @@ function loadPdfjs() {
 
 async function pdfThumb(source) {
   const pdfjs = await loadPdfjs();
-  // From a URL, pdf.js fetches only the parts it needs (range requests) instead of the whole book.
+  // From a link or a range reader, pdf.js fetches only the parts it needs instead of the whole book.
+  if (source.reader) {
+    const { size, read } = source.reader;
+    const initial = await read(0, Math.min(size, 65536) - 1);
+    const transport = new pdfjs.PDFDataRangeTransport(size, initial);
+    transport.requestDataRange = (begin, end) =>
+      read(begin, end - 1).then((bytes) => transport.onDataRange(begin, bytes));
+    source = { range: transport };
+  }
   const doc = await pdfjs.getDocument({ ...source, disableAutoFetch: true, isEvalSupported: false }).promise;
   try {
     const page = await doc.getPage(1);
@@ -131,18 +139,24 @@ async function epubThumb(bytes) {
 }
 
 /**
- * @param source a File/Blob being uploaded, or a URL of a stored file
+ * @param source a File/Blob being uploaded, a link to a stored file,
+ *               or { size, read(start, endInclusive) → Uint8Array } for a stored file
  * @returns a JPEG Blob, or null when no cover can be made (never throws)
  */
 export async function makeThumb(source, name, type = '') {
   const kind = thumbKind(name, type);
   if (!kind) return null;
   const isUrl = typeof source === 'string';
+  const isReader = !isUrl && typeof source?.read === 'function';
   try {
     if (kind === 'pdf') {
-      return await pdfThumb(isUrl ? { url: source } : { data: new Uint8Array(await source.arrayBuffer()) });
+      if (isUrl) return await pdfThumb({ url: source });
+      if (isReader) return await pdfThumb({ reader: source });
+      return await pdfThumb({ data: new Uint8Array(await source.arrayBuffer()) });
     }
-    const blob = isUrl ? await (await fetch(source)).blob() : source;
+    let blob = source;
+    if (isUrl) blob = await (await fetch(source)).blob();
+    else if (isReader) blob = new Blob([await source.read(0, source.size - 1)]);
     if (kind === 'epub') return await epubThumb(new Uint8Array(await blob.arrayBuffer()));
     return await imageThumb(blob);
   } catch (err) {

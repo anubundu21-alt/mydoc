@@ -17,6 +17,24 @@ It uses React for the frontend, Node.js/Express for the backend and Supabase Sto
 - Works on phones (the sidebar becomes a menu).
 - The storage bucket is **private**. Downloads use short-lived signed links (5 minutes), and the Supabase secret key stays on the server.
 
+## Storage: Google Drive or Supabase
+
+The server uses **Google Drive** when `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REFRESH_TOKEN` are set, and **Supabase** otherwise. `/api/health` shows which one is in use.
+
+With Google Drive:
+- Files live in your Drive under `MyDoc Vault/Ebooks`, `/Rakesh`, `/Priyanka` and `/Ananya`, with covers in `MyDoc Vault/_covers`. The app creates these folders.
+- Files you add to those folders in Google Drive appear on the site. Google Docs, Sheets and shortcuts are skipped.
+- Uploads go straight from the browser to Google. Downloads come through the server in 4 MB pieces, so files are never made public.
+- Deleting a file moves it to the Drive trash, where you can restore it for 30 days.
+
+### Google Drive setup
+
+1. In [Google Cloud Console](https://console.cloud.google.com), create a project and enable the **Google Drive API**.
+2. Under **Google Auth Platform**, create the app (Audience: **External**), then under **Audience** choose **Publish app** (In production). Otherwise the refresh token stops working after 7 days.
+3. Under **Clients**, create an OAuth client of type **Web application**, with the authorized redirect URI `https://developers.google.com/oauthplayground`. Copy the client ID and secret.
+4. At [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), click the gear icon, tick **Use your own OAuth credentials** and paste the ID and secret. Authorize the scope `https://www.googleapis.com/auth/drive` with the Google account that should hold the files, then click **Exchange authorization code for tokens** and copy the **refresh token**.
+5. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REFRESH_TOKEN` (and optionally `GOOGLE_DRIVE_FOLDER_NAME`), then redeploy.
+
 ## How it works
 
 ```
@@ -77,8 +95,9 @@ The browser calls the API at `/api/...` on the same domain, so the services don'
 
 1. Import the GitHub repo in Vercel (*Add New → Project*) and keep the **Root Directory** at the repository root, so Vercel reads `vercel.json`.
 2. Under *Settings → Environment Variables*, add these (they're shared by both services; only `server` uses them):
-   `APP_USERNAME`, `APP_PASSWORD`, `JWT_SECRET` (**required on Vercel**), `SESSION_TTL`, `SUPABASE_URL`,
-   `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_BUCKET`.
+   `APP_USERNAME`, `APP_PASSWORD`, `JWT_SECRET` (**required on Vercel**), `SESSION_TTL`, plus either the
+   Google Drive keys (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`) or the Supabase ones
+   (`SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_BUCKET`).
 3. Deploy. Every push to `main` redeploys.
 
 To test locally the way Vercel runs it, use `vercel dev`.

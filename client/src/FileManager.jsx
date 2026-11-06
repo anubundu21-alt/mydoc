@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, uploadFile, uploadThumb, fileUrl, downloadFile, previewFile } from './api.js';
+import { api, uploadFile, uploadThumb, fileSource, downloadFile, previewFile } from './api.js';
 import Icon from './Icon.jsx';
 import { ConfirmModal, FileBadge, RenameModal, fileKind, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
 import { canMakeThumb, makeThumb, thumbKind } from './thumbs.js';
@@ -58,6 +58,17 @@ export default function FileManager({ section, stats, onChanged }) {
   const [renaming, setRenaming] = useState(null);
   const [localThumbs, setLocalThumbs] = useState({}); // path → object URL of a cover made in this tab
   const thumbOf = (f) => localThumbs[f.path] || f.thumbUrl;
+  const [progress, setProgress] = useState({}); // path → 0..1 while a file is being fetched
+  const track = (path) => (p) => setProgress((x) => ({ ...x, [path]: p }));
+  // Download/preview with a progress bar on the file (Google Drive files come in pieces).
+  const fetchWith = (fn, f) =>
+    run(f.path, async () => {
+      try {
+        await fn(f.path, track(f.path));
+      } finally {
+        setProgress(({ [f.path]: _, ...rest }) => rest);
+      }
+    });
   const inputRef = useRef(null);
   const dragDepth = useRef(0);
 
@@ -94,7 +105,7 @@ export default function FileManager({ section, stats, onChanged }) {
         if (cancelled) return;
         thumbTried.add(f.path);
         try {
-          const blob = await makeThumb(await fileUrl(f.path), f.name, f.type);
+          const blob = await makeThumb(await fileSource(f.path), f.name, f.type);
           if (!blob) continue;
           await uploadThumb(f.path, blob);
           setLocalThumbs((t) => ({ ...t, [f.path]: URL.createObjectURL(blob) }));
@@ -230,10 +241,10 @@ export default function FileManager({ section, stats, onChanged }) {
 
   const actions = (f) => (
     <>
-      <button className="icon-btn" title="Preview" onClick={() => run(f.path, () => previewFile(f.path))}>
+      <button className="icon-btn" title="Preview" onClick={() => fetchWith(previewFile, f)}>
         <Icon name="eye" size={17} />
       </button>
-      <button className="icon-btn" title="Download" onClick={() => run(f.path, () => downloadFile(f.path))}>
+      <button className="icon-btn" title="Download" onClick={() => fetchWith(downloadFile, f)}>
         <Icon name="download" size={17} />
       </button>
       <button className="icon-btn" title="Rename" onClick={() => setRenaming(f)}>
@@ -470,10 +481,15 @@ export default function FileManager({ section, stats, onChanged }) {
               <label className="card-check" title="Select">
                 <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
               </label>
-              <button className="card-preview" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
+              <button className="card-preview" onClick={() => fetchWith(previewFile, f)} title="Open">
                 <Cover file={f} url={thumbOf(f)} size="lg" />
                 {thumbOf(f) && <span className={`type-pill pill-${fileKind(f.name).kind}`}>{fileKind(f.name).ext}</span>}
               </button>
+{progress[f.path] !== undefined && (
+                <div className="fetch-bar" role="progressbar" aria-valuenow={Math.round(progress[f.path] * 100)}>
+                  <div style={{ width: `${Math.max(4, Math.round(progress[f.path] * 100))}%` }} />
+                </div>
+              )}
               <div className="card-body">
                 <div className="card-name" title={f.name}>
                   {f.name}
@@ -505,7 +521,7 @@ export default function FileManager({ section, stats, onChanged }) {
               <label className="check">
                 <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
               </label>
-              <button className="row-name" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
+              <button className="row-name" onClick={() => fetchWith(previewFile, f)} title="Open">
                 <Cover file={f} url={thumbOf(f)} size="sm" />
                 <span className="truncate">{f.name}</span>
                 <span className="row-meta-sm muted">
@@ -515,6 +531,11 @@ export default function FileManager({ section, stats, onChanged }) {
               <span className="col-size muted">{formatSize(f.size)}</span>
               <span className="col-date muted">{formatDate(f.createdAt)}</span>
               <div className="row-actions">{actions(f)}</div>
+              {progress[f.path] !== undefined && (
+                <div className="fetch-bar" role="progressbar" aria-valuenow={Math.round(progress[f.path] * 100)}>
+                  <div style={{ width: `${Math.max(4, Math.round(progress[f.path] * 100))}%` }} />
+                </div>
+              )}
             </div>
           ))}
         </div>

@@ -27,66 +27,141 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
-// PUT a file to a Supabase signed upload URL, with progress.
-function putToSignedUrl(signedUrl, apiKey, blob, name, { upsert = false, onProgress } = {}) {
+// Send a file straight to storage (Supabase signed link or Google Drive upload session), with progress.
+// Returns the parsed JSON reply, if any.
+function sendToStorage({ url, format, headers }, blob, name, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('PUT', signedUrl);
-    if (apiKey) xhr.setRequestHeader('apikey', apiKey);
-    xhr.setRequestHeader('x-upsert', String(upsert));
+    xhr.open('PUT', url);
+    for (const [k, v] of Object.entries(headers || {})) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) return resolve();
-      let msg = `Upload failed (${xhr.status})`;
+      let reply = null;
       try {
-        const j = JSON.parse(xhr.responseText);
-        msg = j.message || j.error || msg;
+        reply = JSON.parse(xhr.responseText);
       } catch {}
-      reject(new Error(msg));
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(reply);
+      reject(new Error(reply?.message || reply?.error?.message || reply?.error || `Upload failed (${xhr.status})`));
     };
     xhr.onerror = () => reject(new Error('Network error during upload'));
-    const form = new FormData();
-    form.append('cacheControl', '3600');
-    form.append('', blob, name); // sent as-is: original quality
-    xhr.send(form);
+    if (format === 'multipart') {
+      const form = new FormData();
+      form.append('cacheControl', '3600');
+      form.append('', blob, name);
+      xhr.send(form);
+    } else {
+      xhr.send(blob); // the original bytes, unchanged
+    }
   });
 }
 
-// Upload the original file bytes straight to Supabase Storage with progress.
+// Upload the original file (no compression or conversion). Returns its path in the app.
 export async function uploadFile(section, file, onProgress) {
-  const { signedUrl, apiKey, path } = await api('/files/upload-url', {
+  const { path, upload } = await api('/files/upload-url', {
     method: 'POST',
-    body: { section, name: file.name },
+    body: { section, name: file.name, size: file.size, type: file.type },
   });
-  await putToSignedUrl(signedUrl, apiKey, file, file.name, { onProgress });
-  return path;
+  const reply = await sendToStorage(upload, file, file.name, onProgress);
+  return path || `${section}/${reply?.id}`;
 }
 
 // Store (or replace) the small cover image shown on a file's card.
-export async function uploadThumb(path, blob) {
-  const { signedUrl, apiKey } = await api('/files/thumb-upload-url', { method: 'POST', body: { path } });
-  await putToSignedUrl(signedUrl, apiKey, blob, 'cover.jpg', { upsert: true });
+export async function uploadThumb(path, jpeg) {
+  const res = await fetch(`/api/files/thumb?path=${encodeURIComponent(path)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/jpeg', Authorization: `Bearer ${getToken()}` },
+    body: jpeg,
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Cover upload failed (${res.status})`);
 }
 
-// Short-lived link to read a stored file (used to make covers for older uploads).
-export async function fileUrl(path) {
-  return (await api(`/files/download-url?preview=1&path=${encodeURIComponent(path)}`)).url;
+const fileInfo = (path, preview) =>
+  api(`/files/download-url?${preview ? 'preview=1&' : ''}path=${encodeURIComponent(path)}`);
+
+// Bytes start..end (inclusive) of a stored file, fetched through the server in pieces it allows.
+async function readRange(path, start, end, chunkSize) {
+  const parts = [];
+  for (let s = start; s <= end; s += chunkSize) {
+    const e = Math.min(end, s + chunkSize - 1);
+    const res = await fetch(`/api/files/content?path=${encodeURIComponent(path)}&start=${s}&end=${e}`, {
+      headers: { Authorization: `Bearer ${getToken()}` },
+    });
+    if (res.status === 401) onUnauthorized();
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Download failed (${res.status})`);
+    parts.push(new Uint8Array(await res.arrayBuffer()));
+  }
+  if (parts.length === 1) return parts[0];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
 }
 
-export async function downloadFile(path) {
-  const { url } = await api(`/files/download-url?path=${encodeURIComponent(path)}`);
+// The whole file as a Blob, reading up to 3 pieces at a time.
+async function readWhole(path, info, onProgress) {
+  const { size, chunkSize, type } = info;
+  const starts = [];
+  for (let s = 0; s < size; s += chunkSize) starts.push(s);
+  const parts = new Array(starts.length);
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < starts.length) {
+      const i = next++;
+      parts[i] = await readRange(path, starts[i], Math.min(size, starts[i] + chunkSize) - 1, chunkSize);
+      done += parts[i].length;
+      onProgress?.(size ? done / size : 1);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  return new Blob(parts, { type });
+}
+
+// What the cover maker reads a stored file from: a link, or a reader that fetches byte ranges.
+export async function fileSource(path) {
+  const info = await fileInfo(path, true);
+  if (info.url) return info.url;
+  return { size: info.size, read: (start, end) => readRange(path, start, end, info.chunkSize) };
+}
+
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.rel = 'noopener';
+  a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-export async function previewFile(path) {
-  const win = window.open('', '_blank');
+export async function downloadFile(path, onProgress) {
+  const info = await fileInfo(path, false);
+  if (info.url) {
+    const a = document.createElement('a');
+    a.href = info.url;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return;
+  }
+  saveBlob(await readWhole(path, info, onProgress), info.name);
+}
+
+export async function previewFile(path, onProgress) {
+  const win = window.open('', '_blank'); // opened right away so pop-up blockers allow it
   try {
-    const { url } = await api(`/files/download-url?preview=1&path=${encodeURIComponent(path)}`);
+    const info = await fileInfo(path, true);
+    let url = info.url;
+    if (!url) {
+      win?.document.write('<p style="font:16px system-ui;padding:24px;color:#475569">Opening…</p>');
+      url = URL.createObjectURL(await readWhole(path, info, onProgress));
+      setTimeout(() => URL.revokeObjectURL(url), 10 * 60_000);
+    }
     if (win) win.location.href = url;
     else window.location.href = url;
   } catch (e) {
