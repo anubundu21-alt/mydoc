@@ -135,35 +135,60 @@ app.get('/api/me', (req, res) => res.json({ username: req.user.sub }));
 
 app.get('/api/sections', (req, res) => res.json(SECTIONS));
 
+async function listSection(section) {
+  const files = [];
+  const pageSize = 1000;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await bucket().list(section, {
+      limit: pageSize,
+      offset,
+      sortBy: { column: 'created_at', order: 'desc' },
+    });
+    if (error) throw error;
+    for (const item of data) {
+      if (!item.id || item.name === '.emptyFolderPlaceholder') continue; // skip folders/placeholders
+      files.push({
+        path: `${section}/${item.name}`,
+        name: displayName(item.name),
+        size: item.metadata?.size ?? 0,
+        type: item.metadata?.mimetype ?? '',
+        createdAt: item.created_at,
+        updatedAt: item.updated_at,
+      });
+    }
+    if (data.length < pageSize) break;
+  }
+  return files;
+}
+
 // List files in a section
 app.get(
   '/api/files',
   asyncRoute(async (req, res) => {
     const section = String(req.query.section || '');
     assertSection(section);
-    const files = [];
-    const pageSize = 1000;
-    for (let offset = 0; ; offset += pageSize) {
-      const { data, error } = await bucket().list(section, {
-        limit: pageSize,
-        offset,
-        sortBy: { column: 'created_at', order: 'desc' },
-      });
-      if (error) throw error;
-      for (const item of data) {
-        if (!item.id || item.name === '.emptyFolderPlaceholder') continue; // skip folders/placeholders
-        files.push({
-          path: `${section}/${item.name}`,
-          name: displayName(item.name),
-          size: item.metadata?.size ?? 0,
-          type: item.metadata?.mimetype ?? '',
-          createdAt: item.created_at,
-          updatedAt: item.updated_at,
-        });
-      }
-      if (data.length < pageSize) break;
-    }
-    res.json(files);
+    res.json(await listSection(section));
+  })
+);
+
+// File count, total size and latest upload for every section
+app.get(
+  '/api/stats',
+  asyncRoute(async (req, res) => {
+    const entries = await Promise.all(
+      Object.keys(SECTIONS).map(async (s) => {
+        const files = await listSection(s);
+        return [
+          s,
+          {
+            count: files.length,
+            size: files.reduce((n, f) => n + f.size, 0),
+            lastUpload: files.reduce((d, f) => (!d || f.createdAt > d ? f.createdAt : d), null),
+          },
+        ];
+      })
+    );
+    res.json(Object.fromEntries(entries));
   })
 );
 

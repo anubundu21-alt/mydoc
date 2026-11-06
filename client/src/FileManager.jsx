@@ -1,57 +1,70 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, uploadFile, downloadFile, previewFile } from './api.js';
+import Icon from './Icon.jsx';
+import { ConfirmModal, FileBadge, RenameModal, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
 
-const formatSize = (b) => {
-  if (!b) return '0 B';
-  const u = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
-  return `${(b / 1024 ** i).toFixed(i ? 1 : 0)} ${u[i]}`;
+const SORTS = {
+  'date-desc': 'Newest first',
+  'date-asc': 'Oldest first',
+  'name-asc': 'Name (A–Z)',
+  'name-desc': 'Name (Z–A)',
+  'size-desc': 'Largest first',
+  'size-asc': 'Smallest first',
 };
 
-const formatDate = (d) => (d ? new Date(d).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '');
-
-function iconFor(name, type) {
-  const ext = name.split('.').pop().toLowerCase();
-  if (['pdf'].includes(ext)) return '📕';
-  if (['epub', 'mobi', 'azw', 'azw3', 'fb2', 'djvu'].includes(ext)) return '📘';
-  if (type.startsWith('image/')) return '🖼️';
-  if (type.startsWith('video/')) return '🎬';
-  if (type.startsWith('audio/')) return '🎵';
-  if (['doc', 'docx', 'odt', 'rtf', 'txt', 'md'].includes(ext)) return '📝';
-  if (['xls', 'xlsx', 'csv', 'ods'].includes(ext)) return '📊';
-  if (['ppt', 'pptx', 'odp'].includes(ext)) return '📽️';
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '🗜️';
-  return '📄';
+function readPref(key, fallback) {
+  try {
+    return localStorage.getItem(key) || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
-export default function FileManager({ section }) {
+export default function FileManager({ section, stats, onChanged }) {
+  const toast = useToast();
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
-  const [sort, setSort] = useState('date-desc');
+  const [sort, setSort] = useState(() => readPref('mydoc_sort', 'date-desc'));
+  const [view, setView] = useState(() => readPref('mydoc_view', 'grid'));
   const [uploads, setUploads] = useState([]);
   const [selected, setSelected] = useState(new Set());
   const [dragging, setDragging] = useState(false);
   const [busyPath, setBusyPath] = useState(null);
+  const [confirm, setConfirm] = useState(null); // { title, message, onConfirm }
+  const [renaming, setRenaming] = useState(null);
   const inputRef = useRef(null);
+  const dragDepth = useRef(0);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('mydoc_sort', sort);
+      localStorage.setItem('mydoc_view', view);
+    } catch {}
+  }, [sort, view]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      setFiles(await api(`/files?section=${section}`));
+      setFiles(await api(`/files?section=${section.id}`));
       setSelected(new Set());
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
-  }, [section]);
+  }, [section.id]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const refresh = async () => {
+    await load();
+    onChanged?.();
+  };
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -59,7 +72,7 @@ export default function FileManager({ section }) {
     const [key, dir] = sort.split('-');
     const m = dir === 'asc' ? 1 : -1;
     list.sort((a, b) => {
-      if (key === 'name') return m * a.name.localeCompare(b.name);
+      if (key === 'name') return m * a.name.localeCompare(b.name, undefined, { numeric: true });
       if (key === 'size') return m * (a.size - b.size);
       return m * (new Date(a.createdAt) - new Date(b.createdAt));
     });
@@ -68,7 +81,7 @@ export default function FileManager({ section }) {
 
   async function handleFiles(fileList) {
     const items = Array.from(fileList).map((file) => ({
-      id: crypto.randomUUID(),
+      id: Math.random().toString(36).slice(2),
       file,
       progress: 0,
       status: 'uploading',
@@ -78,22 +91,25 @@ export default function FileManager({ section }) {
     setUploads((u) => [...items, ...u]);
     const update = (id, patch) => setUploads((u) => u.map((x) => (x.id === id ? { ...x, ...patch } : x)));
 
-    // Upload up to 3 files at a time
     const queue = [...items];
+    let ok = 0;
     const worker = async () => {
       while (queue.length) {
         const it = queue.shift();
         try {
-          await uploadFile(section, it.file, (p) => update(it.id, { progress: p }));
+          await uploadFile(section.id, it.file, (p) => update(it.id, { progress: p }));
           update(it.id, { progress: 1, status: 'done' });
+          ok++;
         } catch (e) {
           update(it.id, { status: 'error', error: e.message });
         }
       }
     };
     await Promise.all([worker(), worker(), worker()]);
-    load();
-    setTimeout(() => setUploads((u) => u.filter((x) => x.status !== 'done')), 4000);
+    if (ok) toast(`${ok} file${ok === 1 ? '' : 's'} uploaded to ${section.label}`);
+    if (ok < items.length) toast(`${items.length - ok} upload${items.length - ok === 1 ? '' : 's'} failed`, 'error');
+    refresh();
+    setTimeout(() => setUploads((u) => u.filter((x) => x.status !== 'done')), 3000);
   }
 
   async function run(path, fn) {
@@ -101,41 +117,46 @@ export default function FileManager({ section }) {
     try {
       await fn();
     } catch (e) {
-      alert(e.message);
+      toast(e.message, 'error');
     } finally {
       setBusyPath(null);
     }
   }
 
-  const onDelete = (f) =>
-    confirm(`Delete "${f.name}"? This cannot be undone.`) &&
-    run(f.path, async () => {
-      await api('/files', { method: 'DELETE', body: { path: f.path } });
-      setFiles((fs) => fs.filter((x) => x.path !== f.path));
+  const askDelete = (paths, label) =>
+    setConfirm({
+      title: paths.length > 1 ? `Delete ${paths.length} files?` : 'Delete file?',
+      message: (
+        <>
+          <strong>{label}</strong> will be permanently removed from your vault. This cannot be undone.
+        </>
+      ),
+      onConfirm: async () => {
+        try {
+          await api('/files', { method: 'DELETE', body: { paths } });
+          toast(paths.length > 1 ? `${paths.length} files deleted` : 'File deleted');
+          setConfirm(null);
+          refresh();
+        } catch (e) {
+          toast(e.message, 'error');
+        }
+      },
     });
 
-  const onRename = (f) => {
-    const name = prompt('New name', f.name);
-    if (!name || name === f.name) return;
-    run(f.path, async () => {
-      await api('/files', { method: 'PATCH', body: { path: f.path, name } });
-      await load();
-    });
-  };
-
-  const deleteSelected = async () => {
-    if (!selected.size || !confirm(`Delete ${selected.size} selected file(s)? This cannot be undone.`)) return;
+  const saveRename = async (name) => {
     try {
-      await api('/files', { method: 'DELETE', body: { paths: [...selected] } });
-      await load();
+      await api('/files', { method: 'PATCH', body: { path: renaming.path, name } });
+      toast('File renamed');
+      setRenaming(null);
+      load();
     } catch (e) {
-      alert(e.message);
+      toast(e.message, 'error');
     }
   };
 
   const downloadSelected = async () => {
     for (const p of selected) {
-      await downloadFile(p).catch((e) => alert(e.message));
+      await downloadFile(p).catch((e) => toast(e.message, 'error'));
       await new Promise((r) => setTimeout(r, 400));
     }
   };
@@ -149,37 +170,64 @@ export default function FileManager({ section }) {
   const allChecked = visible.length > 0 && visible.every((f) => selected.has(f.path));
   const toggleAll = () => setSelected(allChecked ? new Set() : new Set(visible.map((f) => f.path)));
 
-  const totalSize = files.reduce((n, f) => n + f.size, 0);
+  const count = stats?.count ?? files.length;
+  const size = stats?.size ?? files.reduce((n, f) => n + f.size, 0);
+  const last = stats?.lastUpload ?? files[0]?.createdAt;
+
+  const actions = (f) => (
+    <>
+      <button className="icon-btn" title="Preview" onClick={() => run(f.path, () => previewFile(f.path))}>
+        <Icon name="eye" size={17} />
+      </button>
+      <button className="icon-btn" title="Download" onClick={() => run(f.path, () => downloadFile(f.path))}>
+        <Icon name="download" size={17} />
+      </button>
+      <button className="icon-btn" title="Rename" onClick={() => setRenaming(f)}>
+        <Icon name="edit" size={17} />
+      </button>
+      <button className="icon-btn danger" title="Delete" onClick={() => askDelete([f.path], f.name)}>
+        <Icon name="trash" size={17} />
+      </button>
+    </>
+  );
 
   return (
-    <section
-      className={`files ${dragging ? 'dragging' : ''}`}
-      onDragOver={(e) => {
+    <div
+      className="page"
+      onDragEnter={(e) => {
         e.preventDefault();
+        dragDepth.current++;
         setDragging(true);
       }}
-      onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}
+      onDragOver={(e) => e.preventDefault()}
+      onDragLeave={() => {
+        dragDepth.current--;
+        if (dragDepth.current <= 0) setDragging(false);
+      }}
       onDrop={(e) => {
         e.preventDefault();
+        dragDepth.current = 0;
         setDragging(false);
         handleFiles(e.dataTransfer.files);
       }}
     >
-      <div className="toolbar">
-        <input className="search" placeholder="Search files…" value={query} onChange={(e) => setQuery(e.target.value)} />
-        <select value={sort} onChange={(e) => setSort(e.target.value)}>
-          <option value="date-desc">Newest first</option>
-          <option value="date-asc">Oldest first</option>
-          <option value="name-asc">Name A–Z</option>
-          <option value="name-desc">Name Z–A</option>
-          <option value="size-desc">Largest first</option>
-          <option value="size-asc">Smallest first</option>
-        </select>
-        <button className="btn" onClick={load} title="Refresh">
-          ⟳
-        </button>
-        <button className="btn primary" onClick={() => inputRef.current.click()}>
-          ⬆ Upload
+      <header className={`page-head tone-${section.tone}`}>
+        <div className="page-title">
+          {section.icon ? (
+            <span className={`head-icon tone-${section.tone}`}>
+              <Icon name={section.icon} size={24} />
+            </span>
+          ) : (
+            <span className={`avatar xl tone-${section.tone}`}>{section.initials}</span>
+          )}
+          <div>
+            <div className="eyebrow">{section.group}</div>
+            <h1>{section.title}</h1>
+            <p className="muted">{section.subtitle}</p>
+          </div>
+        </div>
+        <button className="btn btn-primary btn-lg" onClick={() => inputRef.current.click()}>
+          <Icon name="upload" size={18} /> Upload files
         </button>
         <input
           ref={inputRef}
@@ -191,105 +239,243 @@ export default function FileManager({ section }) {
             e.target.value = '';
           }}
         />
+      </header>
+
+      <div className="stats">
+        <div className="stat">
+          <span className={`stat-icon tone-${section.tone}`}>
+            <Icon name="file" size={18} />
+          </span>
+          <div>
+            <div className="stat-value">{count}</div>
+            <div className="stat-label">Files</div>
+          </div>
+        </div>
+        <div className="stat">
+          <span className="stat-icon tone-teal">
+            <Icon name="database" size={18} />
+          </span>
+          <div>
+            <div className="stat-value">{formatSize(size)}</div>
+            <div className="stat-label">Storage used</div>
+          </div>
+        </div>
+        <div className="stat">
+          <span className="stat-icon tone-violet">
+            <Icon name="clock" size={18} />
+          </span>
+          <div>
+            <div className="stat-value">{timeAgo(last)}</div>
+            <div className="stat-label">Last upload</div>
+          </div>
+        </div>
       </div>
 
       <div className="dropzone" onClick={() => inputRef.current.click()}>
-        Drag &amp; drop files here, or click to choose. Files are stored exactly as uploaded (original quality).
+        <span className="drop-icon">
+          <Icon name="cloud" size={22} />
+        </span>
+        <div>
+          <div className="drop-title">
+            Drop files here or <span className="link">browse</span>
+          </div>
+          <div className="drop-sub">PDF, EPUB, images, documents and more. Stored in original quality.</div>
+        </div>
       </div>
 
       {uploads.length > 0 && (
-        <ul className="uploads">
+        <div className="panel uploads">
           {uploads.map((u) => (
-            <li key={u.id} className={u.status}>
-              <span className="up-name">{u.file.name}</span>
-              <span className="up-size muted">{formatSize(u.file.size)}</span>
-              {u.status === 'error' ? (
-                <span className="error-text" title={u.error}>
-                  ✕ {u.error}
-                </span>
-              ) : (
-                <div className="bar">
-                  <div style={{ width: `${Math.round(u.progress * 100)}%` }} />
+            <div key={u.id} className={`upload-row ${u.status}`}>
+              <FileBadge name={u.file.name} />
+              <div className="upload-main">
+                <div className="upload-top">
+                  <span className="truncate">{u.file.name}</span>
+                  <span className="muted small">
+                    {u.status === 'error'
+                      ? 'Failed'
+                      : u.status === 'done'
+                        ? 'Done'
+                        : `${Math.round(u.progress * 100)}% · ${formatSize(u.file.size)}`}
+                  </span>
                 </div>
+                {u.status === 'error' ? (
+                  <div className="error-text small">{u.error}</div>
+                ) : (
+                  <div className="progress">
+                    <div style={{ width: `${Math.round(u.progress * 100)}%` }} />
+                  </div>
+                )}
+              </div>
+              {u.status === 'done' && (
+                <span className="done-check">
+                  <Icon name="check" size={16} />
+                </span>
               )}
-              {u.status === 'done' && <span className="ok">✓</span>}
               {u.status === 'error' && (
-                <button className="btn ghost small" onClick={() => setUploads((x) => x.filter((y) => y.id !== u.id))}>
-                  Dismiss
+                <button className="icon-btn" onClick={() => setUploads((x) => x.filter((y) => y.id !== u.id))}>
+                  <Icon name="x" size={16} />
                 </button>
               )}
-            </li>
+            </div>
           ))}
-        </ul>
+        </div>
       )}
 
-      <div className="summary muted">
-        {files.length} file{files.length === 1 ? '' : 's'} · {formatSize(totalSize)}
-        {selected.size > 0 && (
-          <span className="bulk">
-            {selected.size} selected
-            <button className="btn small" onClick={downloadSelected}>
-              Download
+      <div className="toolbar">
+        <div className="search">
+          <Icon name="search" size={17} />
+          <input
+            className="input"
+            placeholder={`Search in ${section.label}…`}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {query && (
+            <button className="input-action" onClick={() => setQuery('')} aria-label="Clear search">
+              <Icon name="x" size={15} />
             </button>
-            <button className="btn small danger" onClick={deleteSelected}>
-              Delete
-            </button>
-          </span>
-        )}
+          )}
+        </div>
+        <select className="input select" value={sort} onChange={(e) => setSort(e.target.value)}>
+          {Object.entries(SORTS).map(([k, v]) => (
+            <option key={k} value={k}>
+              {v}
+            </option>
+          ))}
+        </select>
+        <div className="segmented" role="group" aria-label="View">
+          <button className={view === 'grid' ? 'on' : ''} onClick={() => setView('grid')} title="Grid view">
+            <Icon name="grid" size={16} />
+          </button>
+          <button className={view === 'list' ? 'on' : ''} onClick={() => setView('list')} title="List view">
+            <Icon name="list" size={16} />
+          </button>
+        </div>
+        <button className="icon-btn bordered" onClick={refresh} title="Refresh">
+          <Icon name="refresh" size={16} className={loading ? 'spin' : ''} />
+        </button>
       </div>
 
-      {error && <div className="error">{error}</div>}
-
-      {loading ? (
-        <div className="empty muted">Loading…</div>
-      ) : visible.length === 0 ? (
-        <div className="empty muted">{query ? 'No files match your search.' : 'No files yet. Upload something!'}</div>
-      ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th className="chk">
-                <input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all" />
-              </th>
-              <th>Name</th>
-              <th className="hide-sm">Size</th>
-              <th className="hide-sm">Uploaded</th>
-              <th className="actions-col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((f) => (
-              <tr key={f.path} className={busyPath === f.path ? 'busy' : ''}>
-                <td className="chk">
-                  <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
-                </td>
-                <td>
-                  <button className="name-btn" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
-                    <span className="ficon">{iconFor(f.name, f.type)}</span>
-                    <span className="fname">{f.name}</span>
-                  </button>
-                  <div className="show-sm muted small-text">
-                    {formatSize(f.size)} · {formatDate(f.createdAt)}
-                  </div>
-                </td>
-                <td className="hide-sm nowrap">{formatSize(f.size)}</td>
-                <td className="hide-sm nowrap">{formatDate(f.createdAt)}</td>
-                <td className="actions">
-                  <button className="btn small" onClick={() => run(f.path, () => downloadFile(f.path))} title="Download">
-                    ⬇<span className="hide-sm"> Download</span>
-                  </button>
-                  <button className="btn small ghost" onClick={() => onRename(f)} title="Rename">
-                    ✎
-                  </button>
-                  <button className="btn small ghost danger" onClick={() => onDelete(f)} title="Delete">
-                    🗑
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {selected.size > 0 && (
+        <div className="selection-bar">
+          <label className="check">
+            <input type="checkbox" checked={allChecked} onChange={toggleAll} />
+            <span>{selected.size} selected</span>
+          </label>
+          <div className="spacer" />
+          <button className="btn btn-sm" onClick={downloadSelected}>
+            <Icon name="download" size={15} /> Download
+          </button>
+          <button
+            className="btn btn-sm btn-danger-soft"
+            onClick={() => askDelete([...selected], `${selected.size} file${selected.size === 1 ? '' : 's'}`)}
+          >
+            <Icon name="trash" size={15} /> Delete
+          </button>
+          <button className="icon-btn" onClick={() => setSelected(new Set())} title="Clear selection">
+            <Icon name="x" size={16} />
+          </button>
+        </div>
       )}
-    </section>
+
+      {error && (
+        <div className="alert-box">
+          <Icon name="alert" size={16} /> {error}
+        </div>
+      )}
+
+      {loading && files.length === 0 ? (
+        <div className={view === 'grid' ? 'grid' : 'panel list'}>
+          {Array.from({ length: view === 'grid' ? 8 : 5 }).map((_, i) => (
+            <div key={i} className={view === 'grid' ? 'card skeleton' : 'row skeleton'} />
+          ))}
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="empty">
+          <div className={`empty-art tone-${section.tone}`}>
+            <Icon name={query ? 'search' : section.icon || 'folder'} size={30} />
+          </div>
+          <h3>{query ? 'No matching files' : 'Nothing here yet'}</h3>
+          <p className="muted">
+            {query ? `Nothing in ${section.label} matches “${query}”.` : `Upload your first file to ${section.label}.`}
+          </p>
+          {!query && (
+            <button className="btn btn-primary" onClick={() => inputRef.current.click()}>
+              <Icon name="upload" size={16} /> Upload files
+            </button>
+          )}
+        </div>
+      ) : view === 'grid' ? (
+        <div className="grid">
+          {visible.map((f) => (
+            <div
+              key={f.path}
+              className={`card ${selected.has(f.path) ? 'selected' : ''} ${busyPath === f.path ? 'busy' : ''}`}
+            >
+              <label className="card-check" title="Select">
+                <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
+              </label>
+              <button className="card-preview" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
+                <FileBadge name={f.name} large />
+              </button>
+              <div className="card-body">
+                <div className="card-name" title={f.name}>
+                  {f.name}
+                </div>
+                <div className="card-meta">
+                  {formatSize(f.size)} · {formatDate(f.createdAt)}
+                </div>
+              </div>
+              <div className="card-actions">{actions(f)}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="panel list">
+          <div className="row head">
+            <label className="check">
+              <input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all" />
+            </label>
+            <span>Name</span>
+            <span className="col-size">Size</span>
+            <span className="col-date">Uploaded</span>
+            <span />
+          </div>
+          {visible.map((f) => (
+            <div
+              key={f.path}
+              className={`row ${selected.has(f.path) ? 'selected' : ''} ${busyPath === f.path ? 'busy' : ''}`}
+            >
+              <label className="check">
+                <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
+              </label>
+              <button className="row-name" onClick={() => run(f.path, () => previewFile(f.path))} title="Open">
+                <FileBadge name={f.name} />
+                <span className="truncate">{f.name}</span>
+                <span className="row-meta-sm muted">
+                  {formatSize(f.size)} · {formatDate(f.createdAt)}
+                </span>
+              </button>
+              <span className="col-size muted">{formatSize(f.size)}</span>
+              <span className="col-date muted">{formatDate(f.createdAt)}</span>
+              <div className="row-actions">{actions(f)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {dragging && (
+        <div className="drag-overlay">
+          <div className="drag-card">
+            <Icon name="cloud" size={40} />
+            <div>Drop to upload to {section.label}</div>
+          </div>
+        </div>
+      )}
+
+      {confirm && <ConfirmModal {...confirm} onClose={() => setConfirm(null)} />}
+      {renaming && <RenameModal name={renaming.name} onSave={saveRename} onClose={() => setRenaming(null)} />}
+    </div>
   );
 }
