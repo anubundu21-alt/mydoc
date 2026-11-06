@@ -63,6 +63,29 @@ It deploys as-is to Render, Railway, Fly.io or a VPS:
 - Start command: `npm start`
 - Set the variables from `server/.env.example` in the host's environment settings.
 
+## Deploy on Vercel
+
+`vercel.json` deploys the repo as **one Vercel project with two services** on one domain:
+
+| Service  | Folder    | Framework | Public path |
+|----------|-----------|-----------|-------------|
+| `server` | `server/` | Express   | `/api/*`    |
+| `client` | `client/` | Vite      | everything else (`/*`) |
+
+The browser calls the API at `/api/...` on the same domain, so the services don't call each other directly and no bindings are needed.
+
+1. Import the GitHub repo in Vercel (*Add New → Project*) and keep the **Root Directory** at the repository root, so Vercel reads `vercel.json`.
+2. Under *Settings → Environment Variables*, add these (they're shared by both services; only `server` uses them):
+   `APP_USERNAME`, `APP_PASSWORD`, `JWT_SECRET` (**required on Vercel**), `SESSION_TTL`, `SUPABASE_URL`,
+   `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_BUCKET`.
+3. Deploy. Every push to `main` redeploys.
+
+To test locally the way Vercel runs it, use `vercel dev`.
+
+Notes:
+- On Vercel the server runs as a serverless function: it doesn't call `app.listen()` and doesn't serve the React files.
+- The login rate limit is kept in memory for each running copy of the function, so on Vercel it is approximate.
+
 ## File size limit
 
 Uploads go straight from your browser to Supabase, so this server sets no size limit.

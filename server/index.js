@@ -9,6 +9,9 @@ import rateLimit from 'express-rate-limit';
 import { createClient } from '@supabase/supabase-js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// On Vercel this file runs as a serverless function: no app.listen(), no static files,
+// and several short-lived instances can serve requests side by side.
+const IS_VERCEL = !!process.env.VERCEL;
 
 const {
   APP_USERNAME,
@@ -23,12 +26,15 @@ const {
 
 for (const [name, value] of Object.entries({ APP_USERNAME, APP_PASSWORD, SUPABASE_URL, SUPABASE_SECRET_KEY })) {
   if (!value) {
-    console.error(`Missing required environment variable ${name}. See server/.env.example.`);
-    process.exit(1);
+    throw new Error(`Missing required environment variable ${name}. See server/.env.example.`);
   }
 }
 
 let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET && IS_VERCEL) {
+  // Each serverless instance would invent its own secret and reject the others' logins.
+  throw new Error('JWT_SECRET must be set in the Vercel project environment variables.');
+}
 if (!JWT_SECRET) {
   JWT_SECRET = crypto.randomBytes(48).toString('hex');
   console.warn('JWT_SECRET not set: using a random one. Everyone is logged out when the server restarts.');
@@ -106,6 +112,16 @@ const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next
 
 const app = express();
 app.disable('x-powered-by');
+if (IS_VERCEL) app.set('trust proxy', 1); // real client IP for the login rate limiter
+
+// All routes live under /api, which is also the public path Vercel rewrites to this service.
+// If the platform hands the request over without that prefix, put it back.
+if (IS_VERCEL) {
+  app.use((req, res, next) => {
+    if (req.url !== '/api' && !req.url.startsWith('/api/')) req.url = `/api${req.url === '/' ? '' : req.url}`;
+    next();
+  });
+}
 app.use(express.json({ limit: '100kb' }));
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
@@ -250,9 +266,10 @@ app.delete(
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-// Serve the built React app in production
+// Single-server mode (npm start): also serve the built React app.
+// On Vercel the "client" service serves it instead.
 const clientDist = path.resolve(__dirname, '../client/dist');
-if (fs.existsSync(clientDist)) {
+if (!IS_VERCEL && fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 }
@@ -264,6 +281,10 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: err.message || 'Server error' });
 });
 
-app.listen(PORT, () => console.log(`MyDoc server listening on http://localhost:${PORT}`));
+if (!IS_VERCEL) {
+  app.listen(PORT, () => console.log(`MyDoc server listening on http://localhost:${PORT}`));
+}
 
 ensureBucket().catch((err) => console.error('Could not verify/create the storage bucket:', err.message));
+
+export default app;
