@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, uploadFile, uploadThumb, fileSource, downloadFile, previewFile, saveDetails, searchFiles } from './api.js';
 import Icon from './Icon.jsx';
-import { ConfirmModal, DetailsModal, FileBadge, fileKind, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
+import { ConfirmModal, DetailsModal, FileBadge, fileKind, formatDate, formatSize, useToast } from './ui.jsx';
 import { analyzeFile, canMakeThumb, thumbKind } from './thumbs.js';
 
 // Files already read for a cover/details in this browser session (so failures aren't retried).
@@ -74,7 +74,7 @@ function readPref(key, fallback) {
   }
 }
 
-export default function FileManager({ section, sections, features = {}, stats, onChanged, onOpenSection }) {
+export default function FileManager({ section, sections, features = {}, onChanged, onOpenSection }) {
   const toast = useToast();
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -332,9 +332,6 @@ export default function FileManager({ section, sections, features = {}, stats, o
   const allChecked = visible.length > 0 && visible.every((f) => selected.has(f.path));
   const toggleAll = () => setSelected(allChecked ? new Set() : new Set(visible.map((f) => f.path)));
 
-  const count = stats?.count ?? files.length;
-  const size = stats?.size ?? files.reduce((n, f) => n + f.size, 0);
-  const last = stats?.lastUpload ?? files[0]?.createdAt;
 
   const actions = (f) => (
     <>
@@ -402,48 +399,6 @@ export default function FileManager({ section, sections, features = {}, stats, o
           }}
         />
       </header>
-
-      <div className="stats">
-        <div className="stat">
-          <span className={`stat-icon tone-${section.tone}`}>
-            <Icon name="file" size={18} />
-          </span>
-          <div>
-            <div className="stat-value">{count}</div>
-            <div className="stat-label">Files</div>
-          </div>
-        </div>
-        <div className="stat">
-          <span className="stat-icon tone-teal">
-            <Icon name="database" size={18} />
-          </span>
-          <div>
-            <div className="stat-value">{formatSize(size)}</div>
-            <div className="stat-label">Storage used</div>
-          </div>
-        </div>
-        <div className="stat">
-          <span className="stat-icon tone-violet">
-            <Icon name="clock" size={18} />
-          </span>
-          <div>
-            <div className="stat-value">{timeAgo(last)}</div>
-            <div className="stat-label">Last upload</div>
-          </div>
-        </div>
-      </div>
-
-      <div className="dropzone" onClick={() => inputRef.current.click()}>
-        <span className="drop-icon">
-          <Icon name="cloud" size={22} />
-        </span>
-        <div>
-          <div className="drop-title">
-            Drop files here or <span className="link">browse</span>
-          </div>
-          <div className="drop-sub">PDF, EPUB, images, documents and more. Stored in original quality.</div>
-        </div>
-      </div>
 
       {uploads.length > 0 && (
         <div className="panel uploads">

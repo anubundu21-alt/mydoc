@@ -213,7 +213,6 @@ export default function App() {
           section={current}
           sections={SECTIONS}
           features={features}
-          stats={stats[current.id]}
           onChanged={loadStats}
           onOpenSection={(id) => setSection(id)}
         />
