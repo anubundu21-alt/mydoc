@@ -13,7 +13,9 @@ It uses React for the frontend, Node.js/Express for the backend and Supabase Sto
 - Files are stored **byte-for-byte as uploaded**: no compression or conversion, so they keep their original quality.
 - **Covers on the cards:** the first page of a PDF, the cover image of an EPUB, or the photo itself. They're made in the browser as small JPEGs and stored in `_thumbs/` in the bucket. Files uploaded before covers existed get theirs the first time their folder is opened. Other types (MOBI, Word…) show a coloured file-type badge.
 - Download keeps the original file name. You can also open a file in a new tab to preview it.
-- Rename, delete, multi-select download/delete, search, and sort by name, size or date.
+- **Search** by title, author, keywords or file name, in the current folder or all folders. With Google Drive, search also finds words inside the files (shown as "Found inside"). Drive may take a few minutes to index a new upload.
+- **Book details:** title, author and keywords are read from PDFs and EPUBs automatically and shown on the cards. You can edit them with the pencil button, e.g. to add keywords like "passport" to personal documents. They're stored in the Drive file's description and never overwritten by the automatic reading. Google Drive only.
+- Rename, delete, multi-select download/delete, and sort by name, size or date.
 - Works on phones (the sidebar becomes a menu).
 - The storage bucket is **private**. Downloads use short-lived signed links (5 minutes), and the Supabase secret key stays on the server.
 

@@ -166,3 +166,62 @@ export function RenameModal({ name, onSave, onClose }) {
     </Modal>
   );
 }
+
+// Edit a file's name and, with Google Drive storage, its title / author / keywords.
+export function DetailsModal({ file, withDetails, onSave, onClose }) {
+  const [form, setForm] = useState({
+    name: file.name,
+    title: file.title || '',
+    author: file.author || '',
+    keywords: file.keywords || '',
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    await onSave({ ...form, name: form.name.trim() || file.name });
+    setBusy(false);
+  };
+  return (
+    <Modal title={withDetails ? 'Edit details' : 'Rename file'} onClose={onClose}>
+      <form onSubmit={submit} className="details-form">
+        <label className="field">
+          <span>File name</span>
+          <input className="input" value={form.name} onChange={set('name')} autoFocus={!withDetails} />
+        </label>
+        {withDetails && (
+          <>
+            <label className="field">
+              <span>Title</span>
+              <input className="input" value={form.title} onChange={set('title')} placeholder="e.g. SQL Server Query Tuning" autoFocus />
+            </label>
+            <label className="field">
+              <span>Author</span>
+              <input className="input" value={form.author} onChange={set('author')} placeholder="Optional" />
+            </label>
+            <label className="field">
+              <span>Keywords</span>
+              <textarea
+                className="input textarea"
+                rows={3}
+                value={form.keywords}
+                onChange={set('keywords')}
+                placeholder="Separate with commas, e.g. passport, ID, 2024"
+              />
+            </label>
+            <p className="hint">Search finds files by any of these. Titles and keywords are also saved in Google Drive.</p>
+          </>
+        )}
+        <div className="modal-foot inline">
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn btn-primary" disabled={busy}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

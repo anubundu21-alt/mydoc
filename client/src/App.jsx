@@ -70,6 +70,7 @@ export default function App() {
   const [section, setSection] = useState(() => localStorage.getItem('mydoc_section') || 'ebooks');
   const [menuOpen, setMenuOpen] = useState(false);
   const [stats, setStats] = useState({});
+  const [features, setFeatures] = useState({}); // what the storage supports (book details, search inside files)
   const [isDark, toggleTheme] = useTheme();
 
   const logout = useCallback(() => {
@@ -81,7 +82,10 @@ export default function App() {
     setUnauthorizedHandler(logout);
     if (!getToken()) return;
     api('/me')
-      .then((d) => setUser(d.username))
+      .then((d) => {
+        setUser(d.username);
+        setFeatures(d.features || {});
+      })
       .catch(logout)
       .finally(() => setChecking(false));
   }, [logout]);
@@ -111,6 +115,9 @@ export default function App() {
         onLogin={(token, username) => {
           setToken(token);
           setUser(username);
+          api('/me')
+            .then((d) => setFeatures(d.features || {}))
+            .catch(() => {});
         }}
       />
     );
@@ -201,7 +208,15 @@ export default function App() {
             <Icon name={isDark ? 'sun' : 'moon'} />
           </button>
         </div>
-        <FileManager key={current.id} section={current} stats={stats[current.id]} onChanged={loadStats} />
+        <FileManager
+          key={current.id}
+          section={current}
+          sections={SECTIONS}
+          features={features}
+          stats={stats[current.id]}
+          onChanged={loadStats}
+          onOpenSection={(id) => setSection(id)}
+        />
       </main>
     </div>
   );

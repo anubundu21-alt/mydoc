@@ -72,7 +72,26 @@ function loadPdfjs() {
   return pdfjsPromise;
 }
 
-async function pdfThumb(source) {
+// Book details from file metadata. Titles like "Microsoft Word - draft.docx" or "untitled" are dropped.
+function cleanText(value, max = 300) {
+  const v = Array.isArray(value) ? value.join(', ') : value;
+  return String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+function cleanTitle(value, fileName) {
+  const t = cleanText(value).replace(/^Microsoft (Word|PowerPoint|Excel) - /i, '');
+  const bare = fileName.toLowerCase().replace(/\.[^.]+$/, '');
+  if (!t || t.toLowerCase() === bare) return '';
+  if (/\.(docx?|indd|pdf|qxd|pptx?|xlsx?|tex|dvi|rtf|odt|epub)$/i.test(t)) return '';
+  if (/^(untitled|title|document\d*|unknown|none|book)$/i.test(t)) return '';
+  return t;
+}
+const details = (title, author, keywords, fileName) => ({
+  title: cleanTitle(title, fileName),
+  author: cleanText(author),
+  keywords: cleanText(keywords, 1000),
+});
+
+async function pdfAnalyze(source, wantCover, fileName) {
   const pdfjs = await loadPdfjs();
   // From a link or a range reader, pdf.js fetches only the parts it needs instead of the whole book.
   if (source.reader) {
@@ -85,13 +104,32 @@ async function pdfThumb(source) {
   }
   const doc = await pdfjs.getDocument({ ...source, disableAutoFetch: true, isEvalSupported: false }).promise;
   try {
-    const page = await doc.getPage(1);
-    const base = page.getViewport({ scale: 1 });
-    // Render straight at thumbnail size (pdf.js draws text and vectors crisply at any scale).
-    const viewport = page.getViewport({ scale: Math.min(MAX_W / base.width, MAX_H / base.height, 2) });
-    const { canvas, ctx } = canvasFor(viewport.width, viewport.height);
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    return toJpeg(canvas);
+    const { info = {}, metadata } = await doc.getMetadata().catch(() => ({}));
+    const xmp = (k) => {
+      try {
+        return metadata?.get(k);
+      } catch {
+        return '';
+      }
+    };
+    const subject = cleanText(info.Subject || xmp('dc:description'));
+    const meta = details(
+      info.Title || xmp('dc:title'),
+      info.Author || xmp('dc:creator'),
+      [info.Keywords || xmp('pdf:keywords'), subject.length <= 120 ? subject : ''].filter(Boolean).join(', '),
+      fileName
+    );
+    let cover = null;
+    if (wantCover) {
+      const page = await doc.getPage(1);
+      const base = page.getViewport({ scale: 1 });
+      // Render straight at thumbnail size (pdf.js draws text and vectors crisply at any scale).
+      const viewport = page.getViewport({ scale: Math.min(MAX_W / base.width, MAX_H / base.height, 2) });
+      const { canvas, ctx } = canvasFor(viewport.width, viewport.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      cover = await toJpeg(canvas);
+    }
+    return { cover, details: meta };
   } finally {
     doc.destroy();
   }
@@ -107,17 +145,21 @@ function joinPath(base, href) {
   return out.join('/');
 }
 
-async function epubThumb(bytes) {
+async function epubAnalyze(bytes, wantCover, fileName) {
   const { unzipSync, strFromU8 } = await import('fflate');
   const readOne = (name) => unzipSync(bytes, { filter: (f) => f.name === name })[name];
   const parse = (u8) => new DOMParser().parseFromString(strFromU8(u8), 'application/xml');
 
   const container = readOne('META-INF/container.xml');
-  if (!container) return null;
+  if (!container) return { cover: null, details: details('', '', '', fileName) };
   const opfPath = parse(container).getElementsByTagNameNS('*', 'rootfile')[0]?.getAttribute('full-path');
   const opfBytes = opfPath && readOne(opfPath);
-  if (!opfBytes) return null;
+  if (!opfBytes) return { cover: null, details: details('', '', '', fileName) };
   const opf = parse(opfBytes);
+
+  const dc = (tag) => [...opf.getElementsByTagNameNS('*', tag)].map((e) => e.textContent.trim()).filter(Boolean);
+  const meta = details(dc('title')[0], dc('creator').join(', '), dc('subject').join(', '), fileName);
+  if (!wantCover) return { cover: null, details: meta };
 
   const items = [...opf.getElementsByTagNameNS('*', 'item')];
   const attr = (el, n) => el.getAttribute(n) || '';
@@ -130,37 +172,43 @@ async function epubThumb(bytes) {
     items.find((i) => coverId && attr(i, 'id') === coverId && isImage(i)) || // EPUB 2
     items.find((i) => isImage(i) && /cover/i.test(`${attr(i, 'id')} ${attr(i, 'href')}`)) ||
     items.find(isImage);
-  if (!item) return null;
+  if (!item) return { cover: null, details: meta };
 
   const base = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
   const imgBytes = readOne(joinPath(base, decodeURIComponent(attr(item, 'href'))));
-  if (!imgBytes) return null;
-  return imageThumb(new Blob([imgBytes], { type: attr(item, 'media-type') }));
+  const cover = imgBytes ? await imageThumb(new Blob([imgBytes], { type: attr(item, 'media-type') })) : null;
+  return { cover, details: meta };
 }
 
 /**
+ * Reads a file once to make its cover and pick up its title/author/keywords.
  * @param source a File/Blob being uploaded, a link to a stored file,
  *               or { size, read(start, endInclusive) → Uint8Array } for a stored file
- * @returns a JPEG Blob, or null when no cover can be made (never throws)
+ * @returns { cover: JPEG Blob | null, details: {title, author, keywords} | null } (never throws)
  */
-export async function makeThumb(source, name, type = '') {
+export async function analyzeFile(source, name, type = '', { cover: wantCover = true } = {}) {
   const kind = thumbKind(name, type);
-  if (!kind) return null;
+  if (!kind) return { cover: null, details: null };
   const isUrl = typeof source === 'string';
   const isReader = !isUrl && typeof source?.read === 'function';
   try {
     if (kind === 'pdf') {
-      if (isUrl) return await pdfThumb({ url: source });
-      if (isReader) return await pdfThumb({ reader: source });
-      return await pdfThumb({ data: new Uint8Array(await source.arrayBuffer()) });
+      if (isUrl) return await pdfAnalyze({ url: source }, wantCover, name);
+      if (isReader) return await pdfAnalyze({ reader: source }, wantCover, name);
+      return await pdfAnalyze({ data: new Uint8Array(await source.arrayBuffer()) }, wantCover, name);
     }
+    if (kind === 'image' && !wantCover) return { cover: null, details: details('', '', '', name) };
     let blob = source;
     if (isUrl) blob = await (await fetch(source)).blob();
     else if (isReader) blob = new Blob([await source.read(0, source.size - 1)]);
-    if (kind === 'epub') return await epubThumb(new Uint8Array(await blob.arrayBuffer()));
-    return await imageThumb(blob);
+    if (kind === 'epub') return await epubAnalyze(new Uint8Array(await blob.arrayBuffer()), wantCover, name);
+    return { cover: await imageThumb(blob), details: details('', '', '', name) };
   } catch (err) {
-    console.warn(`Could not make a cover for ${name}:`, err);
-    return null;
+    console.warn(`Could not read ${name}:`, err);
+    return { cover: null, details: null };
   }
+}
+
+export async function makeThumb(source, name, type = '') {
+  return (await analyzeFile(source, name, type)).cover;
 }

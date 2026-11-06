@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
-import { SECTIONS, CHUNK_SIZE, httpError } from './storage/util.js';
+import { SECTIONS, CHUNK_SIZE, httpError, searchWords } from './storage/util.js';
 import { createSupabaseStorage } from './storage/supabase.js';
 import { createDriveStorage } from './storage/gdrive.js';
 
@@ -164,7 +164,7 @@ function requireAuth(req, res, next) {
 
 app.use('/api', requireAuth);
 
-app.get('/api/me', (req, res) => res.json({ username: req.user.sub, storage: storage.kind }));
+app.get('/api/me', (req, res) => res.json({ username: req.user.sub, storage: storage.kind, features: storage.features }));
 
 app.get('/api/sections', (req, res) => res.json(SECTIONS));
 
@@ -175,6 +175,28 @@ app.get(
     const section = String(req.query.section || '');
     assertSection(section);
     res.json(await storage.list(section));
+  })
+);
+
+// Search one section (?section=) or all of them: ?q=words
+app.get(
+  '/api/search',
+  asyncRoute(async (req, res) => {
+    const words = searchWords(req.query.q);
+    if (!words.length) return res.json([]);
+    const section = req.query.section ? String(req.query.section) : '';
+    if (section) assertSection(section);
+    res.json(await storage.search(words, section ? [section] : Object.keys(SECTIONS)));
+  })
+);
+
+// Title / author / keywords of a file. auto=true: read from the file by the browser.
+app.post(
+  '/api/files/details',
+  asyncRoute(async (req, res) => {
+    if (!storage.saveDetails) throw httpError(400, 'Book details need Google Drive storage');
+    const { path, title, author, keywords, auto } = req.body || {};
+    res.json(await storage.saveDetails(parsePath(path), { title, author, keywords }, { auto: !!auto }));
   })
 );
 

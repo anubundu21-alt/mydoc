@@ -56,6 +56,14 @@ export function createSupabaseStorage({ url, secretKey, publishableKey, bucketNa
     kind: 'supabase',
     configErrors,
 
+    features: { details: false, contentSearch: false },
+
+    // File-name search (Supabase has no full-text index of file contents).
+    async search(words, sections) {
+      const lists = await Promise.all(sections.map((s) => this.list(s)));
+      return lists.flat().filter((f) => words.every((w) => f.name.toLowerCase().includes(w)));
+    },
+
     async init() {
       const { data, error } = await client.storage.getBucket(bucketName);
       if (data) return;

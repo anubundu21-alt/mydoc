@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, uploadFile, uploadThumb, fileSource, downloadFile, previewFile } from './api.js';
+import { api, uploadFile, uploadThumb, fileSource, downloadFile, previewFile, saveDetails, searchFiles } from './api.js';
 import Icon from './Icon.jsx';
-import { ConfirmModal, FileBadge, RenameModal, fileKind, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
-import { canMakeThumb, makeThumb, thumbKind } from './thumbs.js';
+import { ConfirmModal, DetailsModal, FileBadge, fileKind, formatDate, formatSize, timeAgo, useToast } from './ui.jsx';
+import { analyzeFile, canMakeThumb, thumbKind } from './thumbs.js';
 
-// Files we already tried to make a cover for in this browser session (so failures aren't retried).
+// Files already read for a cover/details in this browser session (so failures aren't retried).
 const thumbTried = new Set();
+
+const searchWords = (q) => q.toLowerCase().replace(/["'\\]/g, ' ').split(/\s+/).filter(Boolean);
+const searchText = (f) => `${f.name} ${f.title || ''} ${f.author || ''} ${f.keywords || ''}`.toLowerCase();
+const matchesDetails = (f, words) => words.length > 0 && words.every((w) => searchText(f).includes(w));
+const sectionOfPath = (path) => path.split('/')[0];
 
 // The book cover / photo when there is one, otherwise the coloured file-type badge.
 function Cover({ file, url, size }) {
@@ -22,6 +27,33 @@ function Cover({ file, url, size }) {
       draggable="false"
       onError={() => setFailed(true)}
     />
+  );
+}
+
+// Small labels under a file: which folder it's in (for results from other folders) and whether
+// it matched only by the text inside it.
+function FileTags({ f, current, sections, onOpenSection }) {
+  const sec = sectionOfPath(f.path);
+  const other = sec !== current && sections?.find((s) => s.id === sec);
+  if (!other && !f.foundInside) return null;
+  return (
+    <span className="tags">
+      {other && (
+        <span
+          role="link"
+          tabIndex={0}
+          className={`tag tone-${other.tone}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenSection?.(other.id);
+          }}
+          onKeyDown={(e) => e.key === 'Enter' && onOpenSection?.(other.id)}
+        >
+          {other.label}
+        </span>
+      )}
+      {f.foundInside && <span className="tag tag-inside">Found inside</span>}
+    </span>
   );
 }
 
@@ -42,7 +74,7 @@ function readPref(key, fallback) {
   }
 }
 
-export default function FileManager({ section, stats, onChanged }) {
+export default function FileManager({ section, sections, features = {}, stats, onChanged, onOpenSection }) {
   const toast = useToast();
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -55,9 +87,15 @@ export default function FileManager({ section, stats, onChanged }) {
   const [dragging, setDragging] = useState(false);
   const [busyPath, setBusyPath] = useState(null);
   const [confirm, setConfirm] = useState(null); // { title, message, onConfirm }
-  const [renaming, setRenaming] = useState(null);
+  const [editing, setEditing] = useState(null); // file whose name/details are being edited
   const [localThumbs, setLocalThumbs] = useState({}); // path → object URL of a cover made in this tab
   const thumbOf = (f) => localThumbs[f.path] || f.thumbUrl;
+  const [localDetails, setLocalDetails] = useState({}); // path → details read/saved in this tab
+  const withDetails = useCallback((f) => (localDetails[f.path] ? { ...f, ...localDetails[f.path] } : f), [localDetails]);
+  // Search: "folder" = this section, "all" = every section
+  const [scope, setScope] = useState('folder');
+  const [found, setFound] = useState({ key: '', items: [], loading: false, error: '' });
+  const [searchNonce, setSearchNonce] = useState(0);
   const [progress, setProgress] = useState({}); // path → 0..1 while a file is being fetched
   const track = (path) => (p) => setProgress((x) => ({ ...x, [path]: p }));
   // Download/preview with a progress bar on the file (Google Drive files come in pieces).
@@ -96,46 +134,99 @@ export default function FileManager({ section, stats, onChanged }) {
     load();
   }, [load]);
 
-  // Make covers for files uploaded before covers existed (one at a time, in the background).
+  // Save what was read from a file: its cover, and (with Google Drive) its title/author/keywords.
+  const storeAnalysis = useCallback(
+    async (path, name, { cover, details }) => {
+      if (cover) {
+        await uploadThumb(path, cover).catch((e) => console.warn('Cover not saved for', name, e));
+        setLocalThumbs((t) => ({ ...t, [path]: URL.createObjectURL(cover) }));
+      }
+      if (details && features.details) {
+        const saved = await saveDetails(path, details, true).catch((e) => console.warn('Details not saved for', name, e));
+        if (saved) setLocalDetails((d) => ({ ...d, [path]: { ...saved, analyzed: true } }));
+      }
+    },
+    [features.details]
+  );
+
+  // Covers and details for files that don't have them yet, e.g. uploaded earlier or added
+  // straight to Google Drive (one at a time, in the background).
   useEffect(() => {
     let cancelled = false;
-    const todo = files.filter((f) => !f.thumbUrl && !thumbTried.has(f.path) && canMakeThumb(f));
+    const todo = files.filter(
+      (f) => canMakeThumb(f) && !thumbTried.has(f.path) && (!f.thumbUrl || (features.details && !f.analyzed))
+    );
     (async () => {
       for (const f of todo) {
         if (cancelled) return;
         thumbTried.add(f.path);
         try {
-          const blob = await makeThumb(await fileSource(f.path), f.name, f.type);
-          if (!blob) continue;
-          await uploadThumb(f.path, blob);
-          setLocalThumbs((t) => ({ ...t, [f.path]: URL.createObjectURL(blob) }));
+          const result = await analyzeFile(await fileSource(f.path), f.name, f.type, { cover: !f.thumbUrl });
+          await storeAnalysis(f.path, f.name, result);
         } catch (e) {
-          console.warn('Cover not saved for', f.name, e);
+          console.warn('Could not read', f.name, e);
         }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [files]);
+  }, [files, features.details, storeAnalysis]);
 
   const refresh = async () => {
     await load();
     onChanged?.();
+    setSearchNonce((n) => n + 1);
   };
 
+  // Server search (title/keywords everywhere, and text inside files with Google Drive), debounced.
+  const words = useMemo(() => searchWords(query), [query]);
+  const useServer = words.length > 0 && (scope === 'all' || features.contentSearch);
+  const searchKey = useServer ? `${scope}|${words.join(' ')}|${searchNonce}` : '';
+  useEffect(() => {
+    if (!searchKey) return;
+    let stale = false;
+    setFound((f) => ({ ...f, loading: true, error: '' }));
+    const timer = setTimeout(async () => {
+      try {
+        const items = await searchFiles(words.join(' '), scope === 'all' ? '' : section.id);
+        if (!stale) setFound({ key: searchKey, items, loading: false, error: '' });
+      } catch (e) {
+        if (!stale) setFound({ key: searchKey, items: [], loading: false, error: e.message });
+      }
+    }, 350);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [searchKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const searching = words.length > 0;
   const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const list = q ? files.filter((f) => f.name.toLowerCase().includes(q)) : [...files];
+    let list;
+    if (!searching) list = files.map(withDetails);
+    else {
+      // Title/author/keyword/name matches in this folder show at once; server results are added
+      // as they arrive (marked "found inside" when only the file's text matched).
+      const byPath = new Map();
+      for (const f of files.map(withDetails)) if (matchesDetails(f, words)) byPath.set(f.path, f);
+      if (found.key === searchKey) {
+        for (const r of found.items.map(withDetails)) {
+          if (!byPath.has(r.path)) byPath.set(r.path, { ...r, foundInside: !matchesDetails(r, words) });
+        }
+      }
+      list = [...byPath.values()];
+    }
     const [key, dir] = sort.split('-');
     const m = dir === 'asc' ? 1 : -1;
     list.sort((a, b) => {
-      if (key === 'name') return m * a.name.localeCompare(b.name, undefined, { numeric: true });
+      if (key === 'name') return m * (a.title || a.name).localeCompare(b.title || b.name, undefined, { numeric: true });
       if (key === 'size') return m * (a.size - b.size);
       return m * (new Date(a.createdAt) - new Date(b.createdAt));
     });
     return list;
-  }, [files, query, sort]);
+  }, [files, sort, searching, words, found, searchKey, withDetails]);
+  const searchPending = useServer && (found.key !== searchKey || found.loading);
 
   async function handleFiles(fileList) {
     const items = Array.from(fileList).map((file) => ({
@@ -158,13 +249,9 @@ export default function FileManager({ section, stats, onChanged }) {
           const path = await uploadFile(section.id, it.file, (p) => update(it.id, { progress: p }));
           update(it.id, { progress: 1, status: 'done' });
           ok++;
-          // Cover from the local copy: no need to download the file again.
-          const blob = await makeThumb(it.file, it.file.name, it.file.type);
-          if (blob) {
-            thumbTried.add(path);
-            await uploadThumb(path, blob).catch((e) => console.warn('Cover not saved for', it.file.name, e));
-            setLocalThumbs((t) => ({ ...t, [path]: URL.createObjectURL(blob) }));
-          }
+          // Cover and details from the local copy: no need to download the file again.
+          thumbTried.add(path);
+          await storeAnalysis(path, it.file.name, await analyzeFile(it.file, it.file.name, it.file.type));
         } catch (e) {
           update(it.id, { status: 'error', error: e.message });
         }
@@ -191,7 +278,11 @@ export default function FileManager({ section, stats, onChanged }) {
   const askDelete = (paths, label) =>
     setConfirm({
       title: paths.length > 1 ? `Delete ${paths.length} files?` : 'Delete file?',
-      message: (
+      message: features.trash ? (
+        <>
+          <strong>{label}</strong> will be moved to your Google Drive trash. You can restore it from there for 30 days.
+        </>
+      ) : (
         <>
           <strong>{label}</strong> will be permanently removed from your vault. This cannot be undone.
         </>
@@ -208,12 +299,18 @@ export default function FileManager({ section, stats, onChanged }) {
       },
     });
 
-  const saveRename = async (name) => {
+  const saveEdit = async ({ name, ...details }) => {
+    const f = editing;
     try {
-      await api('/files', { method: 'PATCH', body: { path: renaming.path, name } });
-      toast('File renamed');
-      setRenaming(null);
+      if (name && name !== f.name) await api('/files', { method: 'PATCH', body: { path: f.path, name } });
+      if (features.details && ['title', 'author', 'keywords'].some((k) => (details[k] || '') !== (f[k] || ''))) {
+        const saved = await saveDetails(f.path, details);
+        setLocalDetails((d) => ({ ...d, [f.path]: { ...saved, analyzed: true } }));
+      }
+      toast('Saved');
+      setEditing(null);
       load();
+      setSearchNonce((n) => n + 1);
     } catch (e) {
       toast(e.message, 'error');
     }
@@ -247,7 +344,7 @@ export default function FileManager({ section, stats, onChanged }) {
       <button className="icon-btn" title="Download" onClick={() => fetchWith(downloadFile, f)}>
         <Icon name="download" size={17} />
       </button>
-      <button className="icon-btn" title="Rename" onClick={() => setRenaming(f)}>
+      <button className="icon-btn" title={features.details ? 'Edit details' : 'Rename'} onClick={() => setEditing(f)}>
         <Icon name="edit" size={17} />
       </button>
       <button className="icon-btn danger" title="Delete" onClick={() => askDelete([f.path], f.name)}>
@@ -392,15 +489,26 @@ export default function FileManager({ section, stats, onChanged }) {
           <Icon name="search" size={17} />
           <input
             className="input"
-            placeholder={`Search in ${section.label}…`}
+            type="search"
+            enterKeyHint="search"
+            placeholder={features.contentSearch ? 'Search title, author, keywords or text…' : 'Search title, author, keywords…'}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search files"
           />
           {query && (
             <button className="input-action" onClick={() => setQuery('')} aria-label="Clear search">
               <Icon name="x" size={15} />
             </button>
           )}
+        </div>
+        <div className="segmented scope" role="group" aria-label="Search in">
+          <button className={scope === 'folder' ? 'on' : ''} onClick={() => setScope('folder')}>
+            This folder
+          </button>
+          <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>
+            All folders
+          </button>
         </div>
         <select className="input select" value={sort} onChange={(e) => setSort(e.target.value)}>
           {Object.entries(SORTS).map(([k, v]) => (
@@ -421,6 +529,27 @@ export default function FileManager({ section, stats, onChanged }) {
           <Icon name="refresh" size={16} className={loading ? 'spin' : ''} />
         </button>
       </div>
+
+      {searching && (
+        <div className="search-summary">
+          {searchPending ? <span className="spinner xs" /> : <Icon name="search" size={15} />}
+          <span>
+            {visible.length} result{visible.length === 1 ? '' : 's'} for <strong>“{query.trim()}”</strong>{' '}
+            {scope === 'all' ? 'in all folders' : `in ${section.label}`}
+            {searchPending ? ' · searching…' : ''}
+          </span>
+          {scope === 'folder' && (
+            <button className="link-btn" onClick={() => setScope('all')}>
+              Search all folders
+            </button>
+          )}
+        </div>
+      )}
+      {found.error && found.key === searchKey && (
+        <div className="alert-box">
+          <Icon name="alert" size={16} /> {found.error}
+        </div>
+      )}
 
       {selected.size > 0 && (
         <div className="selection-bar">
@@ -450,7 +579,7 @@ export default function FileManager({ section, stats, onChanged }) {
         </div>
       )}
 
-      {loading && files.length === 0 ? (
+      {loading && files.length === 0 && !searching ? (
         <div className={view === 'grid' ? 'grid' : 'panel list'}>
           {Array.from({ length: view === 'grid' ? 8 : 5 }).map((_, i) => (
             <div key={i} className={view === 'grid' ? 'card skeleton' : 'row skeleton'} />
@@ -459,13 +588,22 @@ export default function FileManager({ section, stats, onChanged }) {
       ) : visible.length === 0 ? (
         <div className="empty">
           <div className={`empty-art tone-${section.tone}`}>
-            <Icon name={query ? 'search' : section.icon || 'folder'} size={30} />
+            <Icon name={searching ? 'search' : section.icon || 'folder'} size={30} />
           </div>
-          <h3>{query ? 'No matching files' : 'Nothing here yet'}</h3>
+          <h3>{searching ? (searchPending ? 'Searching…' : 'No matching files') : 'Nothing here yet'}</h3>
           <p className="muted">
-            {query ? `Nothing in ${section.label} matches “${query}”.` : `Upload your first file to ${section.label}.`}
+            {searching
+              ? searchPending
+                ? 'Looking through titles, keywords and file contents.'
+                : `Nothing ${scope === 'all' ? 'in any folder' : `in ${section.label}`} matches “${query.trim()}”.`
+              : `Upload your first file to ${section.label}.`}
           </p>
-          {!query && (
+          {searching && !searchPending && scope === 'folder' && (
+            <button className="btn" onClick={() => setScope('all')}>
+              <Icon name="search" size={16} /> Search all folders
+            </button>
+          )}
+          {!searching && (
             <button className="btn btn-primary" onClick={() => inputRef.current.click()}>
               <Icon name="upload" size={16} /> Upload files
             </button>
@@ -491,12 +629,18 @@ export default function FileManager({ section, stats, onChanged }) {
                 </div>
               )}
               <div className="card-body">
-                <div className="card-name" title={f.name}>
-                  {f.name}
+                <div className="card-name" title={f.title || f.name}>
+                  {f.title || f.name}
                 </div>
+                {(f.author || f.title) && (
+                  <div className="card-sub" title={f.author || f.name}>
+                    {f.author || f.name}
+                  </div>
+                )}
                 <div className="card-meta">
                   {formatSize(f.size)} · {formatDate(f.createdAt)}
                 </div>
+                <FileTags f={f} current={section.id} sections={sections} onOpenSection={onOpenSection} />
               </div>
               <div className="card-actions">{actions(f)}</div>
             </div>
@@ -523,9 +667,13 @@ export default function FileManager({ section, stats, onChanged }) {
               </label>
               <button className="row-name" onClick={() => fetchWith(previewFile, f)} title="Open">
                 <Cover file={f} url={thumbOf(f)} size="sm" />
-                <span className="truncate">{f.name}</span>
-                <span className="row-meta-sm muted">
-                  {formatSize(f.size)} · {formatDate(f.createdAt)}
+                <span className="row-text">
+                  <span className="row-title">{f.title || f.name}</span>
+                  {(f.author || f.title) && <span className="row-sub muted">{f.author || f.name}</span>}
+                  <span className="row-meta-sm muted">
+                    {formatSize(f.size)} · {formatDate(f.createdAt)}
+                  </span>
+                  <FileTags f={f} current={section.id} sections={sections} onOpenSection={onOpenSection} />
                 </span>
               </button>
               <span className="col-size muted">{formatSize(f.size)}</span>
@@ -551,7 +699,9 @@ export default function FileManager({ section, stats, onChanged }) {
       )}
 
       {confirm && <ConfirmModal {...confirm} onClose={() => setConfirm(null)} />}
-      {renaming && <RenameModal name={renaming.name} onSave={saveRename} onClose={() => setRenaming(null)} />}
+      {editing && (
+        <DetailsModal file={editing} withDetails={!!features.details} onSave={saveEdit} onClose={() => setEditing(null)} />
+      )}
     </div>
   );
 }

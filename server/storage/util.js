@@ -27,3 +27,42 @@ export function sanitizeName(name) {
     .trim();
   return cleaned.slice(-180) || 'file';
 }
+
+// Book details kept as plain lines ("Title: …", "Author: …", "Keywords: a, b") in a file's
+// description, so they're readable (and editable) in Google Drive as well.
+const DETAIL_FIELDS = [
+  ['title', 'Title', 300],
+  ['author', 'Author', 300],
+  ['keywords', 'Keywords', 1000],
+];
+
+export function parseDetails(description = '') {
+  const out = {};
+  for (const [key, label] of DETAIL_FIELDS) {
+    const m = String(description || '').match(new RegExp(`^${label}:[ \\t]*(.*)$`, 'mi'));
+    out[key] = m ? m[1].trim() : '';
+  }
+  return out;
+}
+
+export function formatDetails(details = {}) {
+  return DETAIL_FIELDS.map(([key, label, max]) => {
+    let value = String(details[key] ?? '').replace(/\s+/g, ' ').trim();
+    if (key === 'keywords') {
+      value = [...new Set(value.split(/[,;]/).map((k) => k.trim()).filter(Boolean))].join(', ');
+    }
+    return value ? `${label}: ${value.slice(0, max)}` : '';
+  })
+    .filter(Boolean)
+    .join('\n');
+}
+
+// Search text → words (quotes and extra spaces dropped), at most 8.
+export function searchWords(q) {
+  return String(q || '')
+    .toLowerCase()
+    .replace(/["'\\]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 0)
+    .slice(0, 8);
+}

@@ -169,3 +169,11 @@ export async function previewFile(path, onProgress) {
     throw e;
   }
 }
+
+// Title / author / keywords. auto: read from the file automatically (never overwrites edits).
+export const saveDetails = (path, details, auto = false) =>
+  api('/files/details', { method: 'POST', body: { path, ...details, auto } });
+
+// Search one section, or every section when section is empty.
+export const searchFiles = (q, section = '') =>
+  api(`/search?q=${encodeURIComponent(q)}${section ? `&section=${section}` : ''}`);

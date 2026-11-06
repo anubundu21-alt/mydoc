@@ -2,11 +2,12 @@
 //   <root folder, default "MyDoc Vault">/Ebooks, /Rakesh, /Priyanka, /Ananya
 //   covers: <root>/_covers/<file id>.jpg
 // Talks to the Drive REST API with plain fetch (the googleapis package is too big for a function).
-import { SECTIONS, CHUNK_SIZE, httpError } from './util.js';
+import { SECTIONS, CHUNK_SIZE, httpError, parseDetails, formatDetails } from './util.js';
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const COVERS_FOLDER = '_covers';
-const FILE_FIELDS = 'id,name,size,mimeType,createdTime,modifiedTime,parents,trashed';
+const FILE_FIELDS = 'id,name,size,mimeType,createdTime,modifiedTime,parents,trashed,description,appProperties';
+const NOT_GOOGLE_DOC = "not mimeType contains 'application/vnd.google-apps.'";
 
 // Drive query string literal: 'it\'s'
 const lit = (s) => `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
@@ -145,14 +146,29 @@ export function createDriveStorage({
     return listAll(`name = ${lit(`${fileId}.jpg`)} and ${lit(f._covers)} in parents and trashed = false`, 'id');
   }
 
-  const toItem = (section) => (m) => ({
-    path: `${section}/${m.id}`,
-    name: m.name,
-    size: Number(m.size || 0),
-    type: m.mimeType || '',
-    createdAt: m.createdTime,
-    updatedAt: m.modifiedTime,
-  });
+  // Title/author/keywords live in the Drive file's description (readable and editable in Drive too);
+  // appProperties.mydocAnalyzed marks files whose details were already read automatically.
+  const toItem = (section, coverByName) => (m) => {
+    const item = {
+      path: `${section}/${m.id}`,
+      name: m.name,
+      size: Number(m.size || 0),
+      type: m.mimeType || '',
+      createdAt: m.createdTime,
+      updatedAt: m.modifiedTime,
+      ...parseDetails(m.description),
+      analyzed: m.appProperties?.mydocAnalyzed === '1',
+    };
+    const coverId = coverByName?.get(`${m.id}.jpg`);
+    if (coverId) item.thumbUrl = signThumbUrl(coverId);
+    return item;
+  };
+
+  async function coverMap() {
+    const f = await folders();
+    const covers = await listAll(`${lit(f._covers)} in parents and trashed = false`, 'id,name');
+    return new Map(covers.map((c) => [c.name, c.id]));
+  }
 
   return {
     kind: 'google-drive',
@@ -162,23 +178,48 @@ export function createDriveStorage({
       await folders();
     },
 
+    features: { details: true, contentSearch: true, trash: true },
+
     async list(section, { thumbs = true } = {}) {
       const f = await folders();
       const [files, covers] = await Promise.all([
         // Google Docs/Sheets/shortcuts have no file bytes to download, so they're left out.
-        listAll(
-          `${lit(f[section])} in parents and trashed = false and not mimeType contains 'application/vnd.google-apps.'`,
-          FILE_FIELDS
-        ),
-        thumbs ? listAll(`${lit(f._covers)} in parents and trashed = false`, 'id,name') : [],
+        listAll(`${lit(f[section])} in parents and trashed = false and ${NOT_GOOGLE_DOC}`, FILE_FIELDS),
+        thumbs ? coverMap() : null,
       ]);
-      const coverByName = new Map(covers.map((c) => [c.name, c.id]));
-      return files.map((m) => {
-        const item = toItem(section)(m);
-        const coverId = coverByName.get(`${m.id}.jpg`);
-        if (coverId) item.thumbUrl = signThumbUrl(coverId);
-        return item;
+      return files.map(toItem(section, covers));
+    },
+
+    // Google Drive full-text search: file name, description (title/author/keywords) and the text
+    // inside the files. Every word must match.
+    async search(words, sections) {
+      const f = await folders();
+      const inFolders = sections.map((s) => `${lit(f[s])} in parents`).join(' or ');
+      const text = words.map((w) => `fullText contains ${lit(w)}`).join(' and ');
+      const [files, covers] = await Promise.all([
+        listAll(`(${inFolders}) and trashed = false and ${NOT_GOOGLE_DOC} and ${text}`, FILE_FIELDS),
+        coverMap(),
+      ]);
+      const sectionOf = new Map(sections.map((s) => [f[s], s]));
+      return files
+        .map((m) => {
+          const section = sectionOf.get(m.parents?.find((p) => sectionOf.has(p)));
+          return section && toItem(section, covers)(m);
+        })
+        .filter(Boolean);
+    },
+
+    // auto: details read from the file by the browser; skipped if the file was already done, so
+    // they never overwrite details typed in by hand.
+    async saveDetails(ref, details, { auto = false } = {}) {
+      const meta = await ownedFile(ref);
+      if (auto && meta.appProperties?.mydocAnalyzed === '1') return parseDetails(meta.description);
+      const updated = await drive(`/drive/v3/files/${meta.id}`, {
+        method: 'PATCH',
+        query: { fields: 'id,description' },
+        json: { description: formatDetails(details), appProperties: { mydocAnalyzed: '1' } },
       });
+      return parseDetails(updated.description);
     },
 
     // Start a resumable upload; the browser then PUTs the original bytes straight to Google.
