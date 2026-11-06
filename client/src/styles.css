@@ -400,7 +400,8 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
 .card:hover .card-check, .card.selected .card-check { opacity: 1; }
 .card-preview {
   position: relative; overflow: hidden;
-  display: grid; place-items: center; height: 210px; padding: 16px; border: 0; cursor: pointer;
+  --pv-h: 260px; --pv-pad: 16px;
+  display: grid; place-items: center; height: var(--pv-h); padding: var(--pv-pad); border: 0; cursor: pointer;
   background: linear-gradient(180deg, var(--surface-2), var(--surface-hover));
   border-bottom: 1px solid var(--border);
 }
@@ -411,7 +412,9 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
 /* Book covers / photo thumbnails */
 .cover { display: block; background: #fff; }
 .cover-lg {
-  max-width: 100%; max-height: 100%; object-fit: contain;
+  /* Whole page always visible: fit inside the preview area (explicit sizes, since % heights
+     don't resolve reliably inside the grid cell). */
+  width: auto; height: auto; max-width: 100%; max-height: calc(var(--pv-h) - 2 * var(--pv-pad)); object-fit: contain;
   border-radius: 3px 6px 6px 3px;
   box-shadow: 0 10px 22px -8px rgba(15, 23, 42, .45), 0 0 0 1px rgba(15, 23, 42, .08);
 }
@@ -454,7 +457,7 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
 
 /* Skeletons */
 .skeleton { position: relative; overflow: hidden; background: var(--surface); }
-.card.skeleton { height: 296px; }
+.card.skeleton { height: 346px; }
 .row.skeleton { height: 60px; }
 .skeleton::after {
   content: ''; position: absolute; inset: 0;
@@ -544,7 +547,7 @@ input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--primary)
   .stat-icon { width: 32px; height: 32px; }
   .stat-value { font-size: 15px; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
-  .card-preview { height: 170px; padding: 12px; }
+  .card-preview { --pv-h: 220px; --pv-pad: 12px; }
   .card-check { opacity: 1; }
   .row { grid-template-columns: 24px minmax(0, 1fr) auto; padding: 10px; }
   .row.head .col-size, .row .col-size { display: none; }
